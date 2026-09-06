@@ -79,6 +79,49 @@ def load_partial_model():
     return load_epoch(PARTIAL_EPOCH)
 
 
+def checkpoint_file_sha256(epoch: int = PARTIAL_EPOCH) -> str:
+    """SHA-256 of the raw checkpoint FILE on disk (not the loaded module's
+    state_dict) -- see `code_and_state_fingerprint`'s docstring (required
+    change, TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md Change A/D): every new
+    geometry/retrieval cache and manifest must record which checkpoint it
+    was built against, so a stale cache from a different epoch can never be
+    silently reused."""
+    import warnings
+    warnings.filterwarnings("ignore")
+    from stable_worldmodel.data import get_cache_dir
+    p = get_cache_dir(None, sub_folder="checkpoints") / "lewm_droid_s0" / f"weights_epoch_{epoch}.pt"
+    if not p.exists():
+        raise RuntimeError(f"FATAL_DATA_ERROR: checkpoint file not found at {p}")
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def module_state_hash(module) -> str:
+    """SHA-256 over a `torch.nn.Module`'s own parameters AND buffers (order-
+    stable via `state_dict()`'s deterministic key order) -- used both to
+    fingerprint which encoder/projector weights a cache was built from, and
+    (Change C) to verify after training that a supposedly-frozen module's
+    weights and BatchNorm running stats genuinely did not move."""
+    h = hashlib.sha256()
+    for k, v in module.state_dict().items():
+        h.update(k.encode())
+        h.update(v.detach().cpu().numpy().tobytes())
+    return h.hexdigest()
+
+
+def git_commit_hash() -> str:
+    """Best-effort; returns 'unknown' rather than raising if git is
+    unavailable (e.g. a packaged deployment with no .git directory) -- a
+    fingerprint field callers must still be able to compare/reject on, not
+    a hard dependency on git being installed."""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(PROJECT_ROOT),
+                                capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() if out.returncode == 0 else "unknown"
+    except Exception:  # noqa: BLE001 -- fingerprinting must never crash the run over a missing git binary
+        return "unknown"
+
+
 def build_splits(force: bool = False) -> dict:
     """Episode-disjoint splits by deterministic hash. Roles:
       replay_train    -- original training mixture, used by the `continue` arm

@@ -47,6 +47,44 @@ def score_grad_bank(model, state0, real_letters_converted: list[np.ndarray], pip
     return rows
 
 
+def score_grad_bank_aligned(model, state0, real_letters_converted: list[np.ndarray], pipeline,
+                                U_m: np.ndarray) -> list[np.ndarray]:
+    """`score_grad_bank`'s counterpart for the corrected rollout contract
+    (code audit 2026-09-06, TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md Change B)
+    -- used ONLY by need_geometry.py (the two-arm-pilot / v7-need-tree
+    gradient scoring path). `score_grad_bank` above is left completely
+    unchanged for `compute_T_V_W`/autopilot/base_points.py's OLD six-arm
+    `controller.py` pathway, which constructs its own `state0` with a FULL
+    H actions and is out of this task's scope -- see `LeWMRolloutState`'s
+    docstring for why the two pathways cannot share one state shape.
+    `state0` here is a `LeWMRolloutState` (`.emb`: H states, `.act_emb_hist`:
+    H-1 preceding actions); `real_letters_converted` supplies the action(s)
+    to apply from `state0` onward (for the single-letter h=1 callers in this
+    codebase, the SAME real recorded action that produced the real z_next,
+    so this and the direct residual computation invoke exactly the same
+    model input tensors -- Check 1 of TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md)."""
+    Um_t = torch.from_numpy(U_m).float().to(DEVICE)   # (m, D)
+    emb0 = state0.emb.clone().to(DEVICE).unsqueeze(0)
+    emb0.requires_grad_(True)
+    act_emb_hist0 = state0.act_emb_hist.clone().to(DEVICE).unsqueeze(0)
+    emb, act_emb_hist = emb0, act_emb_hist0
+    for seg in real_letters_converted:
+        emb, act_emb_hist = differentiable_step(model, emb, act_emb_hist, seg, pipeline)
+    zeta_final = emb[0, -1]
+
+    rows = []
+    for i in range(U_m.shape[0]):
+        score = zeta_final @ Um_t[i]
+        grad = torch.autograd.grad(score, emb0, retain_graph=True, allow_unused=True)[0]
+        if grad is None:
+            continue
+        v = grad[0, -1].detach().cpu().numpy()
+        n = np.linalg.norm(v)
+        if n > 1e-8:
+            rows.append(v / n)
+    return rows
+
+
 def intersect_tangent_with_Vperp(T_basis: np.ndarray, V_basis: np.ndarray, rtol: float = 1e-6,
                                      atol: float = 1e-10) -> np.ndarray:
     """The actual W = T \\cap V^perp, replacing a confirmed bug (code audit,

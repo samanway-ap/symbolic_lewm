@@ -25,13 +25,13 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from autopilot.common import stable_seed  # noqa: E402
-from autopilot.geometry import intersect_tangent_with_Vperp, local_tangent, score_grad_bank  # noqa: E402
+from autopilot.geometry import intersect_tangent_with_Vperp, local_tangent, score_grad_bank_aligned  # noqa: E402
 from autopilot.need_common import AlphabetLookup, project_residualized  # noqa: E402
 from oracle.droid_actions import load_actions_for_episodes  # noqa: E402
 from oracle.droid_streaming import stream_many_windows  # noqa: E402
 from retrieval.geometric import action_magnitude, path_length  # noqa: E402
 from oracle.lewm_g import (  # noqa: E402
-    DEVICE, FRAMESKIP, HISTORY_SIZE, LeWMWindowState, RAW_ACTION_DIM, encode_pixel_windows_batch,
+    DEVICE, FRAMESKIP, HISTORY_SIZE, LeWMRolloutState, RAW_ACTION_DIM, advance_aligned, encode_pixel_windows_batch,
 )
 
 N_POSITIONS = 20
@@ -99,7 +99,13 @@ def scan_transitions(episode_ids: list[int], seed: int, n_scan: int, pipeline, m
     if not ok:
         return []
     pixel_stack = np.stack([windows[e] for e in ok])
-    emb_stack = encode_pixel_windows_batch(pixel_stack).numpy()   # (N, n_positions, D)
+    # Bug fix, code audit 2026-09-06 (TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md
+    # Change A): thread the SAME (typically epoch-7) `model` this function
+    # already receives, instead of silently re-encoding with the memoized
+    # epoch-20 `get_model()` singleton this call used to default to --
+    # mixing epoch-20 latents with an epoch-7 predictor/predictor-derived
+    # geometry downstream.
+    emb_stack = encode_pixel_windows_batch(pixel_stack, model=model).numpy()   # (N, n_positions, D)
 
     records = []
     for i, eid in enumerate(ok):
@@ -113,23 +119,41 @@ def scan_transitions(episode_ids: list[int], seed: int, n_scan: int, pipeline, m
         ep_path_length = path_length(emb_stack[i])
         ep_action_magnitude = action_magnitude(raw_full)
         for t in range(HISTORY_SIZE - 1, n_positions - 1):
-            ctx_raw = raw_full[t - HISTORY_SIZE + 1:t + 1]                      # (HISTORY_SIZE, FRAMESKIP, RAW_ACTION_DIM)
-            act_norm = pipeline(ctx_raw.reshape(-1, RAW_ACTION_DIM))
-            act_flat = act_norm.reshape(1, HISTORY_SIZE, FRAMESKIP * RAW_ACTION_DIM)
-            a = torch.from_numpy(act_flat).float().to(DEVICE)
+            # Bug fix, code audit 2026-09-06 (Change B): state0 stores only the
+            # H-1 PRECEDING actions [a_{t-H+1},...,a_{t-1}] -- never a_t, the
+            # action aligned with z_t itself -- matching advance_aligned's
+            # unambiguous contract exactly (see LeWMRolloutState's docstring).
+            hist_raw = raw_full[t - HISTORY_SIZE + 1:t]                        # (HISTORY_SIZE-1, FRAMESKIP, RAW_ACTION_DIM)
+            hist_norm = pipeline(hist_raw.reshape(-1, RAW_ACTION_DIM))
+            hist_flat = hist_norm.reshape(1, HISTORY_SIZE - 1, FRAMESKIP * RAW_ACTION_DIM)
+            hist_t = torch.from_numpy(hist_flat).float().to(DEVICE)
             with torch.no_grad():
-                act_emb = model.action_encoder(a)[0].cpu()
+                act_emb_hist = model.action_encoder(hist_t)[0].cpu()            # (HISTORY_SIZE-1, D)
+
+            raw_seg_converted = pipeline.to_convention(raw_full[t].astype(np.float64))   # a_t, droid_100 convention
+            letter = alphabet.letter(raw_seg_converted)
+            a_t_normed = pipeline.normalizer(raw_seg_converted).reshape(1, -1)
+            with torch.no_grad():
+                a_t_emb = model.action_encoder(
+                    torch.from_numpy(a_t_normed).float().unsqueeze(0).to(DEVICE))[0, 0]
+
             emb = torch.from_numpy(emb_stack[i, t - HISTORY_SIZE + 1:t + 1]).float()
-            state0 = LeWMWindowState(emb=emb, act_emb=act_emb)
+            state0 = LeWMRolloutState(emb=emb, act_emb_hist=act_emb_hist)
             z0 = emb_stack[i, t]
             z_next = emb_stack[i, t + 1]
+            # Direct one-step residual via the SAME advance_aligned() the
+            # gradient pathway (score_grad_bank_aligned -> differentiable_step)
+            # uses internally -- for h=1 this guarantees identical model input
+            # tensors between the direct and gradient transitions (Check 1,
+            # TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md section 3).
             with torch.no_grad():
-                pred = model.predict(state0.emb.unsqueeze(0).to(DEVICE), state0.act_emb.unsqueeze(0).to(DEVICE))
-                z_pred = pred[0, -1].cpu().numpy()
-            raw_seg_converted = pipeline.to_convention(raw_full[t].astype(np.float64))
+                _new_emb, _new_hist, pred = advance_aligned(
+                    model, state0.emb.unsqueeze(0).to(DEVICE), state0.act_emb_hist.unsqueeze(0).to(DEVICE),
+                    a_t_emb.to(DEVICE))
+                z_pred = pred[0, 0].cpu().numpy()
             records.append({
                 "eid": int(eid), "t": int(t), "z0": z0, "z_next": z_next, "state0": state0,
-                "raw_seg_converted": raw_seg_converted, "letter": alphabet.letter(raw_seg_converted),
+                "raw_seg_converted": raw_seg_converted, "letter": letter,
                 "residual": z_pred - z_next,
                 "episode_path_length": ep_path_length, "episode_action_magnitude": ep_action_magnitude,
             })
@@ -182,7 +206,7 @@ def build_cell_gradient_basis(records_for_cell: list[dict], model, pipeline, U_m
     grad_rows = []
     for rec in chosen:
         word = [rec["raw_seg_converted"]]
-        grad_rows.extend(score_grad_bank(model, rec["state0"], word, pipeline, U_m))
+        grad_rows.extend(score_grad_bank_aligned(model, rec["state0"], word, pipeline, U_m))
 
     d = U_m.shape[1]
     if not grad_rows:

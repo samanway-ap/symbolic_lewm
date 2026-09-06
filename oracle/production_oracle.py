@@ -23,7 +23,7 @@ from oracle.droid_streaming import stream_episode_frames
 from oracle.latent_oracle import LatentOracle
 from oracle.lewm_g import (
     ActionPipeline, FRAMESKIP, HISTORY_SIZE, RAW_ACTION_DIM, EMBED_DIM,
-    LeWMWindowState, advance, encode_initial_window, get_model,
+    LeWMRolloutState, advance_aligned, encode_initial_rollout_window, get_model,
 )
 
 OUT_DIR = Path(__file__).resolve().parents[1] / "artifacts"
@@ -35,28 +35,35 @@ def _step_fn_from_convention(pipeline: ActionPipeline):
     """Like lewm_g.step_fn_factory, but the raw_action_segment argument is
     ALREADY in droid_100 convention (alphabet medoids are stored that way)
     -- only the normalizer (z-score) stage is applied, not the full
-    convert+normalize pipeline."""
+    convert+normalize pipeline.
+
+    Bug fix, code audit 2026-09-06 (TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md
+    Change B): uses `advance_aligned`/`LeWMRolloutState` (H-1 preceding
+    actions only), not the historical `advance`/`LeWMWindowState` -- see
+    `advance_aligned`'s docstring for why a full-H-actions state is
+    ambiguous. Each alphabet symbol applied here supplies its OWN "current
+    action"; there is no held-over real action to reconcile."""
     model = get_model()
 
-    def step_fn(window: LeWMWindowState, action_segment_converted: np.ndarray) -> LeWMWindowState:
+    def step_fn(window: LeWMRolloutState, action_segment_converted: np.ndarray) -> LeWMRolloutState:
         n_raw = action_segment_converted.shape[0]
         n_model_steps = n_raw // FRAMESKIP
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         emb = window.emb.unsqueeze(0).to(device)
-        act_emb = window.act_emb.unsqueeze(0).to(device)
+        act_emb_hist = window.act_emb_hist.unsqueeze(0).to(device)
         with torch.no_grad():
             for s in range(n_model_steps):
                 chunk = action_segment_converted[s * FRAMESKIP:(s + 1) * FRAMESKIP]
                 normed = pipeline.normalizer(chunk).reshape(1, -1)
                 a = torch.from_numpy(normed).float().unsqueeze(0).to(device)
                 new_act_emb = model.action_encoder(a)[:, 0]
-                emb, act_emb, _pred = advance(model, emb, act_emb, new_act_emb)
-        return LeWMWindowState(emb=emb[0].cpu(), act_emb=act_emb[0].cpu())
+                emb, act_emb_hist, _pred = advance_aligned(model, emb, act_emb_hist, new_act_emb)
+        return LeWMRolloutState(emb=emb[0].cpu(), act_emb_hist=act_emb_hist[0].cpu())
 
     return step_fn
 
 
-def build_reset_windows(pipeline: ActionPipeline) -> dict[str, LeWMWindowState]:
+def build_reset_windows(pipeline: ActionPipeline) -> dict[str, LeWMRolloutState]:
     reset_ids = json.loads((OUT_DIR / "reset_episode_ids.json").read_text())
     n_raw_needed = HISTORY_SIZE * FRAMESKIP
     actions = load_actions_for_episodes(reset_ids, max_frames=n_raw_needed)
@@ -64,7 +71,10 @@ def build_reset_windows(pipeline: ActionPipeline) -> dict[str, LeWMWindowState]:
     for i, eid in enumerate(reset_ids):
         frames = stream_episode_frames(eid, num_frames=HISTORY_SIZE, frameskip=FRAMESKIP)
         raw = actions[eid][:n_raw_needed].reshape(HISTORY_SIZE, FRAMESKIP, RAW_ACTION_DIM)
-        state = encode_initial_window(frames, raw, pipeline)
+        # Reset states are FSM starting points walked forward by arbitrary
+        # alphabet symbols (never "continue the real recorded episode"), so
+        # the window's own real last action is intentionally discarded.
+        state, _real_last_action = encode_initial_rollout_window(frames, raw, pipeline)
         resets[f"{RESET_PREFIX}{i}"] = state
     return resets
 
@@ -81,7 +91,7 @@ def build_production_oracle(pipeline: ActionPipeline, label_fn, alphabet_path: P
     resets = build_reset_windows(pipeline)
     step_fn_raw = _step_fn_from_convention(pipeline)
 
-    def step_fn(window: LeWMWindowState, symbol: str) -> LeWMWindowState:
+    def step_fn(window: LeWMRolloutState, symbol: str) -> LeWMRolloutState:
         return step_fn_raw(window, symbols[symbol])
 
     return LatentOracle(step_fn=step_fn, label_fn=label_fn, resets=resets)

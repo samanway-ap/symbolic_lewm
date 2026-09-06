@@ -35,7 +35,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from oracle.lewm_g import DEVICE, EMBED_DIM, HISTORY_SIZE, advance, encode_initial_window, get_model
+from oracle.lewm_g import DEVICE, EMBED_DIM, HISTORY_SIZE, advance_aligned, encode_initial_rollout_window, get_model
 from oracle.production_oracle import load_alphabet_symbols
 
 OUT_DIR = Path(__file__).resolve().parents[1] / "artifacts"
@@ -105,26 +105,33 @@ def build_soft_score_fns(device=DEVICE) -> dict[str, callable]:
     return fns
 
 
-def differentiable_step(model, emb, act_emb, raw_segment_converted: np.ndarray, pipeline):
-    """One model step with gradients flowing back to `emb`/`act_emb`
+def differentiable_step(model, emb, act_emb_hist, raw_segment_converted: np.ndarray, pipeline):
+    """One model step with gradients flowing back to `emb`/`act_emb_hist`
     (unlike oracle/production_oracle.py's `_step_fn_from_convention`, which
     wraps this in torch.no_grad() for inference). `raw_segment_converted`
     is a (FRAMESKIP,7) array already in droid_100 convention (alphabet
     medoids are stored that way) -- only the z-score normalizer stage
     applies, matching the production oracle's own convention handling.
-    Uses the shared `advance()` (correct action-timing order: the new
-    action is appended to `act_emb` BEFORE `predict` is called) -- see its
-    docstring. For the single-letter (h=1) callers in this codebase the
-    prior append-after-predict bug was benign (the passed-in `act_emb`'s
-    last slot already held the real current action from the caller's own
-    window construction), but for multi-letter suffixes (`len(suffix) > 1`
-    in `compute_relevance_subspace`) each step after the first used a
-    stale action, so this fix changes results for suffix length > 1."""
+
+    Bug fix, code audit 2026-09-06 (TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md
+    Change B): uses `advance_aligned` (H-1 preceding action embeddings,
+    upstream-matching alignment), replacing the previous `advance()` (a
+    full-H-actions state where the newly supplied action was appended
+    BEFORE calling predict -- correct for a caller re-supplying "the
+    action already aligned with the window's own last state", but NOT
+    equivalent to the upstream LeWM rollout convention in general; see
+    `advance_aligned`'s docstring for the exact upstream trace). For the
+    single-letter (h=1) callers in this codebase (autopilot/geometry.py's
+    `score_grad_bank`), the caller supplies the SAME real recorded action
+    that produced the window's own real next state, so this and the direct
+    (non-gradient) residual computation invoke exactly the same model input
+    tensors -- see need_geometry.py's `scan_transitions`, which now also
+    calls `advance_aligned` for its direct prediction, by construction."""
     normed = pipeline.normalizer(raw_segment_converted).reshape(1, -1)
     a = torch.from_numpy(normed).float().unsqueeze(0).to(emb.device)
     new_act_emb = model.action_encoder(a)[:, 0]
-    emb, act_emb, _pred = advance(model, emb, act_emb, new_act_emb)
-    return emb, act_emb
+    emb, act_emb_hist, _pred = advance_aligned(model, emb, act_emb_hist, new_act_emb)
+    return emb, act_emb_hist
 
 
 def compute_relevance_subspace(
@@ -171,15 +178,19 @@ def compute_relevance_subspace(
         chosen = [seeds_i[k] for k in rng.choice(len(seeds_i), size=n_take, replace=False)]
         n_rows_before = len(grad_rows)
         for samp in chosen:
-            state = encode_initial_window(samp["pixels"][:HISTORY_SIZE], samp["raw_action"][:HISTORY_SIZE], dataset.pipeline)
+            # Discards the window's own real last action (`_real_last_action`):
+            # `suffix` supplies its OWN hypothetical action for this sample's
+            # position onward, exactly like production_oracle.py's FSM walk.
+            state, _real_last_action = encode_initial_rollout_window(
+                samp["pixels"][:HISTORY_SIZE], samp["raw_action"][:HISTORY_SIZE], dataset.pipeline)
             emb0 = state.emb.clone().to(device).unsqueeze(0)
             emb0.requires_grad_(True)
-            act_emb0 = state.act_emb.clone().to(device).unsqueeze(0)
+            act_emb_hist0 = state.act_emb_hist.clone().to(device).unsqueeze(0)
 
-            emb, act_emb = emb0, act_emb0
+            emb, act_emb_hist = emb0, act_emb_hist0
             for sym in suffix:
                 seg = symbols_dict[sym]
-                emb, act_emb = differentiable_step(model, emb, act_emb, seg, dataset.pipeline)
+                emb, act_emb_hist = differentiable_step(model, emb, act_emb_hist, seg, dataset.pipeline)
             zeta_final = emb[0, -1]
 
             for fn in active_soft_fns:

@@ -33,9 +33,16 @@ N_CELL_EVAL_SCAN = 400
 def build_cell_eval_slice(episode_ids: list[int], region_id: int, action_letter: str, anchors: np.ndarray,
                              lever0_basis: dict, pipeline: ActionPipeline, alphabet: AlphabetLookup, seed: int,
                              n_per_episode: int = 4, n_scan: int = N_CELL_EVAL_SCAN,
-                             n_positions: int = N_POSITIONS) -> dict:
+                             n_positions: int = N_POSITIONS, model=None) -> dict:
     """Frozen once per node (reused for pre/post-training eval within every
-    stage, exactly like the completed v6 tree's `eval_slice`)."""
+    stage, exactly like the completed v6 tree's `eval_slice`).
+
+    `model` defaults to None (encode_pixel_windows_batch's own epoch-20
+    fallback). Bug fix, code audit 2026-09-06 (TWO_ARM_EXPERIMENT_REQUIRED_
+    CHANGES.md Change A): callers evaluating an epoch-7-trained model MUST
+    pass it explicitly, so region assignment (which anchors/lever0_basis
+    were themselves built in epoch-7 coordinates for) and the eval targets
+    this function encodes are computed in the SAME coordinate system."""
     rng = np.random.default_rng(seed)
     scan_ids = sorted(rng.choice(episode_ids, size=min(n_scan, len(episode_ids)), replace=False).tolist())
     n_raw = n_positions * FRAMESKIP
@@ -47,7 +54,7 @@ def build_cell_eval_slice(episode_ids: list[int], region_id: int, action_letter:
     if not ok:
         return {"samples": [], "episode_ids": []}
     pixel_stack = np.stack([windows[e] for e in ok])
-    emb_stack = encode_pixel_windows_batch(pixel_stack).numpy()
+    emb_stack = encode_pixel_windows_batch(pixel_stack, model=model).numpy()
 
     samples = []
     used_eids = []

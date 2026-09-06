@@ -122,7 +122,10 @@ def build_regions_and_cells(manifest: dict, lever0_basis: dict, model, pipeline,
     route_ids = manifest["episode_ids"]["route_val"]
 
     print("  building region anchors (farthest-point sampling, Lever-0 residualized metric)...", flush=True)
-    anchor_pool_z = build_real_latents_pool(replay_ids, pipeline, n_episodes=250)
+    # Bug fix, code audit 2026-09-06 (Change A): thread this function's own
+    # `model` (epoch-7 on the v7-need/two-arm-pilot path) instead of letting
+    # build_real_latents_pool silently default to the epoch-20 singleton.
+    anchor_pool_z = build_real_latents_pool(replay_ids, pipeline, n_episodes=250, model=model)
     anchors = farthest_point_anchors(anchor_pool_z, lever0_basis, MAX_REGIONS, seed=SEED)
     append_need_ledger({"event_type": "ADJUSTMENT", "reason": "no persisted v6 base-point catalogue found; "
                           "all region anchors built via licensed farthest-point-sampling fallback",
@@ -163,7 +166,8 @@ def build_regions_and_cells(manifest: dict, lever0_basis: dict, model, pipeline,
         if (r, a) in supported_set:   # SS3.3: pool only SUPPORTED sibling actions for global_W
             by_region.setdefault(r, {})[a] = recs
 
-    real_latents_by_region = {r: build_real_latents_pool(replay_ids, pipeline, seed=SEED + r, n_episodes=120)
+    real_latents_by_region = {r: build_real_latents_pool(replay_ids, pipeline, seed=SEED + r, n_episodes=120,
+                                                             model=model)
                                  for r in valid_regions}
 
     all_znext = np.stack([r["z_next"] for (r_, a) in supported for r in by_cell[(r_, a)]])
@@ -446,7 +450,7 @@ def run_confirmation(cand: dict, model, pipeline, anchors, lever0_basis, alphabe
     U8, B8 = load_frozen_directions()
     B_N = cand["geometry"]["B_N"]
     eval_slice = build_cell_eval_slice(confirm_ids, cand["region"], cand["action"], anchors, lever0_basis,
-                                          pipeline, alphabet, seed=SEED + 900)
+                                          pipeline, alphabet, seed=SEED + 900, model=model)
     if not eval_slice["samples"]:
         return {"status": "NO_FRESH_CONFIRMATION_DATA"}
 
@@ -614,7 +618,10 @@ def main():
     else:
         curricula_by_cell, retrieval_stats = run_targeted_retrieval(
             candidates, manifest["episode_ids"]["retrieval_pool"], anchors, lever0_basis, pipeline, model,
-            alphabet, seed=SEED, max_minutes=MAX_RETRIEVAL_MINUTES)
+            alphabet, seed=SEED, max_minutes=MAX_RETRIEVAL_MINUTES,
+            # Six-arm tree's own pre-existing (non-empty-is-enough) starvation
+            # tolerance, left unchanged -- see run_targeted_retrieval's docstring.
+            require_exact_k=False)
         with open(TARGETED_RETRIEVAL_CACHE_PATH, "wb") as f:
             pickle.dump((curricula_by_cell, retrieval_stats), f)
     append_need_ledger({"event_type": "TARGETED_RETRIEVAL_DONE", "timestamp": now_iso(),
@@ -630,7 +637,7 @@ def main():
         run_log[cand["id"]] = {"region": cand["region"], "action": cand["action"]}
         node_eval_slices[cand["id"]] = build_cell_eval_slice(
             manifest["episode_ids"]["route_val"], cand["region"], cand["action"], anchors, lever0_basis,
-            pipeline, alphabet, seed=stable_seed(SEED, cand["id"]))
+            pipeline, alphabet, seed=stable_seed(SEED, cand["id"]), model=model)
         curricula = curricula_by_cell.get((cand["region"], cand["action"]))
         node_datasets[cand["id"]] = build_node_datasets(cand, manifest, pipeline, curricula)
         if node_datasets[cand["id"]] is None:

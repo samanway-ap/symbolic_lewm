@@ -201,6 +201,118 @@ def advance(model, emb: torch.Tensor, act_emb: torch.Tensor, action_embedding: t
     return emb, act_emb, pred
 
 
+@dataclass(frozen=True)
+class LeWMRolloutState:
+    """Bug fix, code audit 2026-09-06 (TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md
+    Change B): a SEPARATE, deliberately narrower type from `LeWMWindowState`
+    above, used ONLY by the corrected multi-step rollout path (`advance_
+    aligned`, `encode_initial_rollout_window`, and their callers in
+    need_geometry.py / need_targeted_retrieval.py / production_oracle.py /
+    signals/relevance_subspace.py). `LeWMWindowState` (and `advance`) are
+    left completely unchanged for every OTHER existing caller (autopilot/
+    base_points.py, e0_degeneracy/, e1_geometry/, e0c_repair/,
+    a0_label_repair/, rollout_batch/rollout_batch_from_convention/
+    step_fn_factory below, and their own many callers under eval/ and
+    oracle/horizon*.py) -- none of those are part of the two-arm curriculum
+    experiment this fix targets, and blanket-editing the shared dataclass/
+    function would have silently changed already-completed, already-
+    reported historical phases (E0/E1/A0/E0c) well outside this task's
+    explicitly narrow scope.
+
+    Stores only HISTORY_SIZE-1 PRECEDING action embeddings -- never the
+    action aligned with its own last state -- which is what makes the
+    upstream LeWM rollout convention (github.com/lucas-maes/le-wm jepa.py's
+    `JEPA.rollout`) unambiguous: `advance_aligned` always requires the
+    caller to supply "the action to apply now," and there is only one
+    place it could go (concatenated onto `act_emb_hist` to fill out the
+    trailing slot, aligned index-for-index with `emb`), never two candidate
+    conventions (was the last H actions the history INCLUDING or EXCLUDING
+    the action for the state that's about to be superseded?)."""
+    emb: torch.Tensor           # (HISTORY_SIZE, EMBED_DIM)
+    act_emb_hist: torch.Tensor  # (HISTORY_SIZE-1, EMBED_DIM)
+
+
+def advance_aligned(model, emb: torch.Tensor, act_emb_hist: torch.Tensor,
+                       action_embedding: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The ONE model step for the corrected two-arm-experiment rollout path
+    (code audit 2026-09-06, TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md Change B).
+
+    `emb`: (B, HISTORY_SIZE, D) states ending at the CURRENT state z_t.
+    `act_emb_hist`: (B, HISTORY_SIZE-1, D) the PRECEDING actions
+    [a_{t-H+1},...,a_{t-1}] -- everything except a_t.
+    `action_embedding`: (B, D) or (D,) -- a_t, the action to apply WHILE IN
+    z_t (i.e. aligned with `emb`'s LAST/trailing slot).
+
+    Builds the full H-length action window [act_emb_hist, a_t] -- aligned
+    INDEX-FOR-INDEX with `emb` (both length H, both ending at time t) --
+    and calls `model.predict` on it, exactly matching the upstream LeWM
+    `JEPA.rollout` convention (github.com/lucas-maes/le-wm, jepa.py:61-103):
+    there, at every iteration, `act_trunc = act_emb[:, -HS:]` and
+    `emb_trunc = emb[:, -HS:]` are trailing slices of the SAME growing
+    arrays, so their last elements are always the SAME index/timestep by
+    construction -- `act_trunc`'s last entry (the action aligned with
+    `emb_trunc`'s last entry, i.e. a_t) is what predicts z_{t+1}; the NEXT
+    action is only appended AFTER that predict call, in preparation for the
+    following iteration. The previous `advance()` in this module instead
+    appended the newly supplied action into a FULL H-length `act_emb`
+    BEFORE calling predict on that same iteration -- correct only if the
+    caller's "newly supplied action" always meant "a_t, re-supplied", never
+    "the next NEW action after an already-aligned window" (`rollout_batch`
+    and friends supply the latter), silently reproducing a variant of the
+    original mistiming bug one level up. Storing only H-1 preceding actions
+    here removes the ambiguity: there is exactly one thing `action_embedding`
+    can mean (a_t), and exactly one place it can go (the window's trailing
+    slot, alongside `emb`'s trailing slot)."""
+    if action_embedding.dim() == 1:
+        action_embedding = action_embedding.unsqueeze(0)
+    action_embedding = action_embedding.unsqueeze(1)                    # (B,1,D)
+    full_act = torch.cat([act_emb_hist, action_embedding], dim=1)       # (B,H,D), index-aligned with emb
+    pred = model.predict(emb, full_act)[:, -1:]                          # z_{t+1}
+    new_emb = torch.cat([emb[:, 1:], pred], dim=1)
+    new_act_emb_hist = torch.cat([act_emb_hist[:, 1:], action_embedding], dim=1)   # drop oldest, append a_t
+    return new_emb, new_act_emb_hist, pred
+
+
+def encode_initial_rollout_window(
+    pixel_frames: np.ndarray,        # (HISTORY_SIZE, H, W, 3) uint8, subsampled by FRAMESKIP
+    raw_actions: np.ndarray,         # (HISTORY_SIZE, FRAMESKIP, RAW_ACTION_DIM) float, per-position action pairs
+    pipeline: "ActionPipeline",
+    model=None,
+) -> tuple[LeWMRolloutState, torch.Tensor]:
+    """`encode_initial_window`'s counterpart for the corrected rollout
+    contract (Change B) -- returns (state, last_action_embedding) instead of
+    a bare state: `state.act_emb_hist` holds only the FIRST HISTORY_SIZE-1
+    of the window's H real recorded actions; `last_action_embedding` is the
+    H-th (i.e. a_t, the action aligned with the window's own last state).
+    Callers that want to reproduce the window's OWN real recorded
+    transition (e.g. need_geometry.py's residual/gradient scoring) pass
+    `last_action_embedding` into the first `advance_aligned` call; callers
+    doing a HYPOTHETICAL rollout from this window (production_oracle.py,
+    signals/relevance_subspace.py) supply their own first action instead
+    and simply discard `last_action_embedding`.
+
+    `model` defaults to the memoized epoch-20 singleton (Change A) --
+    autopilot-path callers must pass their own (typically epoch-7) model
+    explicitly."""
+    model = model or get_model()
+    tfm = _img_transform()
+
+    px = torch.from_numpy(pixel_frames).float() / 255.0
+    px = px.permute(0, 3, 1, 2)
+    px = tfm({"pixels": px})["pixels"].unsqueeze(0)
+
+    act_norm = pipeline(raw_actions.reshape(-1, RAW_ACTION_DIM))
+    act_flat = act_norm.reshape(HISTORY_SIZE, FRAMESKIP * RAW_ACTION_DIM)
+    act = torch.from_numpy(act_flat).float().unsqueeze(0)
+
+    with torch.no_grad():
+        info = model.encode({"pixels": px.to(DEVICE), "action": act.to(DEVICE)})
+    emb_full = info["emb"][0].cpu()             # (H, D)
+    act_emb_full = info["act_emb"][0].cpu()      # (H, D)
+    state = LeWMRolloutState(emb=emb_full, act_emb_hist=act_emb_full[:-1])
+    return state, act_emb_full[-1]
+
+
 def encode_initial_window(
     pixel_frames: np.ndarray,        # (HISTORY_SIZE, H, W, 3) uint8, subsampled by FRAMESKIP
     raw_actions: np.ndarray,         # (HISTORY_SIZE, FRAMESKIP, RAW_ACTION_DIM) float, per-position action pairs
@@ -226,12 +338,24 @@ def encode_initial_window(
     return LeWMWindowState(emb=info["emb"][0].cpu(), act_emb=info["act_emb"][0].cpu())
 
 
-def encode_pixel_windows_batch(pixel_windows: np.ndarray, batch_size: int = 32) -> torch.Tensor:
+def encode_pixel_windows_batch(pixel_windows: np.ndarray, batch_size: int = 32, model=None) -> torch.Tensor:
     """pixel_windows: (B, H, h, w, 3) uint8 -> (B, H, EMBED_DIM). Pixels-only
     (no action_encoder call) -- used for the k-medoids visual-diversity
     diagnostic (Phase A.2), which is about scene/visual structure, not
-    action semantics, and for L_max's ground-truth encoding of real frames."""
-    model = get_model()
+    action semantics, and for L_max's ground-truth encoding of real frames.
+
+    `model` defaults to the memoized epoch-20 `get_model()` singleton, which
+    is correct for every historical (pre-two-arm-pilot) caller of this
+    function. Bug fix (code audit 2026-09-06, TWO_ARM_EXPERIMENT_REQUIRED_
+    CHANGES.md Change A): the AUTOPILOT/two-arm-pilot path loads and trains
+    a DIFFERENT, epoch-7 partial checkpoint (`autopilot.common.
+    load_partial_model`) and threads it explicitly through every other
+    encode/predict call in that path -- but this function silently ignored
+    that and always re-encoded pixels with the epoch-20 singleton instead,
+    mixing epoch-20 latents with an epoch-7 predictor/predictor-derived
+    geometry. Every autopilot-path caller MUST pass its own `model`
+    explicitly; only callers outside that path may rely on the default."""
+    model = model if model is not None else get_model()
     tfm = _img_transform()
     B, H = pixel_windows.shape[:2]
     out = []

@@ -86,7 +86,17 @@ def fit_pipeline(episode_ids: list[int], seed: int = SEED) -> "ActionPipeline":
     return ActionPipeline.fit(np.concatenate([v for v in fit_actions.values() if len(v) > 0], axis=0))
 
 
-def build_real_latents_pool(episode_ids: list[int], pipeline, seed: int = SEED, n_episodes: int = 300) -> np.ndarray:
+def build_real_latents_pool(episode_ids: list[int], pipeline, seed: int = SEED, n_episodes: int = 300,
+                                model=None) -> np.ndarray:
+    """`model` defaults to None -- `encode_pixel_windows_batch` then falls
+    back to the memoized epoch-20 singleton, EXACTLY this function's
+    existing/historical behavior for every current caller (this module's
+    own six-arm `run_node`, unmodified/unrun in this pass). Bug fix, code
+    audit 2026-09-06 (TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md Change A):
+    callers on the v7-need/two-arm-pilot path (need_controller.py's
+    `build_regions_and_cells`) now pass their own epoch-7 `model` explicitly
+    instead of silently mixing epoch-20 T-basis latents with an epoch-7
+    predictor elsewhere in the same geometry."""
     from autopilot.dataset import build_dataset_from_episodes
     rng = np.random.default_rng(seed)
     sample_ids = sorted(rng.choice(episode_ids, size=min(n_episodes, len(episode_ids)), replace=False).tolist())
@@ -95,7 +105,7 @@ def build_real_latents_pool(episode_ids: list[int], pipeline, seed: int = SEED, 
         raise RuntimeError("FATAL_DATA_ERROR: could not build any real-latent samples for T")
     from oracle.lewm_g import encode_pixel_windows_batch
     pix = np.stack([s["pixels"] for s in ds.samples])
-    emb = encode_pixel_windows_batch(pix).numpy()   # (N, HISTORY_SIZE+1, D)
+    emb = encode_pixel_windows_batch(pix, model=model).numpy()   # (N, HISTORY_SIZE+1, D)
     return emb.reshape(-1, emb.shape[-1])
 
 

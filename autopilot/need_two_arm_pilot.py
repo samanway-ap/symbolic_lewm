@@ -1,24 +1,27 @@
-"""Two-arm feasibility pilot: does the frozen action-conditioned need
+"""Two-arm feasibility pilot, v2: does the frozen action-conditioned need
 curriculum (`need_curriculum`) beat matched-random sampling
-(`matched_random`) at short-horizon, frozen-encoder prediction, in the
-node's own predeclared need subspace N(r,a,1)?
+(`matched_random`) at short-horizon, frozen-encoder(+projector) prediction,
+in the node's own predeclared need subspace N(r,a,1)?
 
-Separate from, and does not modify, the v7 experiment tree: reuses its
-frozen artifacts READ-ONLY (partial checkpoint, Lever-0 basis + U4, region
-anchors, the frozen N00/N01/N02 T/V/W/N geometry, action-letter alphabet,
-episode splits) via `need_controller.get_or_reconstruct_frozen_candidates`
-and `need_targeted_retrieval.run_targeted_retrieval` (both already require
-an exact match against Attempt 1's recorded geometry before proceeding, so
-this pilot inherits that guarantee for free). Writes ONLY under the
-`need_two_arm_pilot_*` namespace and never assigns/opens a confirm_A/B/C
-shard. This is a feasibility signal, not a confirmatory test -- see
-DECISION RULE below for exactly what a positive result does and does not
-license.
+v2 (TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md, reviewed revision db57a54):
+implements Changes A-F required before this experiment is interpretable.
+The v1 result (`need_two_arm_pilot_metrics.json`, TWO_ARM_NEGATIVE) is
+superseded, not deleted -- see `mark_v1_invalidated`. This script writes
+ONLY under the `need_two_arm_v2_*` namespace, never loads v1's frozen
+geometry/retrieval caches (Change D: different checkpoint coordinates,
+different need-space math, different action-timing convention -- those
+caches are invalid under this code), and never assigns/opens a
+confirm_A/B/C shard (this is a feasibility signal, not a confirmatory test
+-- see the DECISION RULE in `main` for exactly what a positive result does
+and does not license).
 """
 from __future__ import annotations
 
 import copy
+import json
+import random
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -34,84 +37,251 @@ torch.set_num_threads(4)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from autopilot.common import (  # noqa: E402
-    OUT_DIR, SEED, assert_disjoint_splits, build_splits, copy_to_downloads, load_frozen_directions,
-    load_partial_model, now_iso, stable_seed, write_atomic,
+    OUT_DIR, SEED, assert_disjoint_splits, build_splits, checkpoint_file_sha256, copy_to_downloads,
+    git_commit_hash, load_frozen_directions, load_partial_model, module_state_hash, now_iso, short_hash,
+    stable_seed, write_atomic,
 )
 from autopilot.controller import fit_pipeline  # noqa: E402
 from autopilot.dataset import ArmDataset, build_dataset_from_segments, build_replay_dataset  # noqa: E402
 from autopilot.evaluate import assert_slice_nonempty, build_eval_slice, evaluate_E_W, paired_bootstrap_ci  # noqa: E402
 from autopilot.need_common import AlphabetLookup, WallClockBudget, load_lever0_basis  # noqa: E402
-from autopilot.need_controller import get_or_reconstruct_frozen_candidates  # noqa: E402
+from autopilot.need_controller import build_regions_and_cells  # noqa: E402
 from autopilot.need_evaluate import build_cell_eval_slice, effective_rank, full_latent_predictions  # noqa: E402
-from autopilot.need_targeted_retrieval import run_targeted_retrieval  # noqa: E402
-from autopilot.train_arm import freeze_encoder, unfreeze_trainable  # noqa: E402
+from autopilot.need_targeted_retrieval import (  # noqa: E402
+    K_FALLBACK, K_TARGET, MIN_COMMON_ELIGIBLE, N_OCCURRENCES_CAP, PER_EPISODE_CAP,
+    resample_random_traj_curriculum, run_targeted_retrieval,
+)
+from checkpoints import PARTIAL_EPOCH  # noqa: E402
 from oracle.lewm_g import DEVICE, HISTORY_SIZE  # noqa: E402
 from training.finetune import _collate  # noqa: E402
 
-PILOT_DIR = OUT_DIR / "need_two_arm_pilot_nodes"
-MANIFEST_PATH = OUT_DIR / "need_two_arm_pilot_manifest.json"
-METRICS_PATH = OUT_DIR / "need_two_arm_pilot_metrics.json"
-REPORT_PATH = OUT_DIR / "need_two_arm_pilot_report.md"
+PILOT_DIR = OUT_DIR / "need_two_arm_v2_nodes"
+MANIFEST_PATH = OUT_DIR / "need_two_arm_v2_manifest.json"
+METRICS_PATH = OUT_DIR / "need_two_arm_v2_metrics.json"
+REPORT_PATH = OUT_DIR / "need_two_arm_v2_report.md"
+FROZEN_GEOMETRY_NPZ = OUT_DIR / "need_two_arm_v2_frozen_geometry.npz"
+FROZEN_GEOMETRY_FINGERPRINT_JSON = OUT_DIR / "need_two_arm_v2_frozen_geometry_fingerprint.json"
 
-MAX_WALL_HOURS = 2.0
-RETRIEVAL_MAX_MINUTES = 60.0
+V1_METRICS_PATH = OUT_DIR / "need_two_arm_pilot_metrics.json"   # superseded, not deleted -- see mark_v1_invalidated
+
+GEOMETRY_SCHEMA_VERSION = 2
+
+MAX_WALL_HOURS = 5.0    # was 2.0 under v1's 2-arm x 2-seed design (4 training runs);
+                          # v2's 2-arm x 5-pair design needs 10 -- scaled proportionally,
+                          # decided from the known compute-scaling factor, not from any outcome.
+RETRIEVAL_MAX_MINUTES = 60.0   # Change F: a safety ABORT now, not a sampling truncation.
 # pilot's OWN K-cascade (distinct from the main tree's 200-threshold/200-K,
 # 100-threshold/100-K): >=200 eligible segments -> K=100; else >=100 -> K=50;
 # else infeasible. Same Stage 1/2 mechanism as the main tree, parameterized.
 K_TARGET_THRESHOLD = 200
-K_TARGET = 100
+PILOT_K_TARGET = 100
 K_FALLBACK_THRESHOLD = 100
-K_FALLBACK = 50
-MIN_COMMON_ELIGIBLE = K_FALLBACK_THRESHOLD
+PILOT_K_FALLBACK = 50
+PILOT_MIN_COMMON_ELIGIBLE = K_FALLBACK_THRESHOLD
 
 N_UPDATES_DIAGNOSTIC = 200
 N_UPDATES_PRIMARY = 500
-SEEDS = [0, 1]
+N_PAIRS = 5                 # Change: section 4 -- 5 paired repetitions, replacing v1's 2 seeds.
+PAIR_SEEDS = list(range(N_PAIRS))
 BATCH_SIZE = 32
 LR = 5e-5
 WEIGHT_DECAY = 1e-3
-MIN_RELATIVE_GAIN = 0.02
 GLOBAL_REGRESSION_MAX = 0.02
 EFFRANK_DROP_MAX = 0.10
-MIN_COMMON_K = 10          # below this, the two arms cannot be meaningfully compared -- infeasible
 MIN_EVAL_EPISODES = 5      # fail-closed floor for eval/guard slices (P1-8)
+MIN_PAIRS_FOR_SIGN = 4      # "at least four of five pairs" (section 4 decision rule)
 
 
-def freeze_common_k_segments(need_segments: list[dict], random_segments: list[dict]) -> tuple[list, list, int]:
-    """Bug fix, code audit 2026-09-06 (P0-4): `K` counted SELECTED SEGMENTS,
-    but each arm could independently return fewer than `k_use` (the
-    alignment-ratio cascade can starve short of `k_use`), so the two arms'
-    datasets were not guaranteed the same cardinality -- "matched compute"
-    was asserted in a comment, not enforced in code. Both arms' ALREADY-
-    RANKED segment lists (highest-alignment / earliest-reservoir-index
-    first) are here truncated to the same common K = min(len(need),
-    len(random)), so both arms train on exactly K segments plus exactly the
-    same replay examples. Returns (need_segments[:k], random_segments[:k], k)."""
-    k = min(len(need_segments), len(random_segments))
-    return need_segments[:k], random_segments[:k], k
+def mark_v1_invalidated() -> None:
+    """Change D: "Mark the prior TWO_ARM_NEGATIVE report as
+    INVALIDATED_IMPLEMENTATION, without deleting or rewriting its numerical
+    contents." Additive metadata patch only -- every original field is kept
+    verbatim; only new `invalidated`/`invalidation_reason` keys are added
+    (or refreshed, if this has already run before)."""
+    if not V1_METRICS_PATH.exists():
+        return
+    payload = json.loads(V1_METRICS_PATH.read_text())
+    payload["invalidated"] = True
+    payload["invalidation_reason"] = (
+        "TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md (reviewed revision db57a54): this result mixed an epoch-20 "
+        "encoder with an epoch-7 predictor in several latent-encoding call sites (Change A), computed the "
+        "action-timing alignment inconsistently with the upstream LeWM rollout convention (Change B), left the "
+        "projector trainable despite frozen-geometry claims (Change C), and paired/aggregated statistics without "
+        "the corrections in Changes D-F. Not deleted or numerically rewritten -- see need_two_arm_v2_metrics.json "
+        "for the corrected implementation's result."
+    )
+    payload["invalidated_by"] = str(METRICS_PATH.name)
+    write_atomic(V1_METRICS_PATH, payload)
+    print(f"  marked {V1_METRICS_PATH.name} INVALIDATED_IMPLEMENTATION (numerical contents preserved verbatim)",
+          flush=True)
+
+
+def compute_fingerprint(model, pipeline, alphabet: AlphabetLookup, U8: np.ndarray, manifest: dict) -> dict:
+    """Change A ("a runtime assertion recording the intended checkpoint hash
+    with every latent cache") / Change D ("put this fingerprint in every new
+    cache and manifest; refuse cache loading when any fingerprint field
+    differs or is absent"). Every field here is either a content hash of
+    something that, if it changed, would silently invalidate the geometry
+    this pilot depends on, or a declared selection constant."""
+    return {
+        "schema_version": GEOMETRY_SCHEMA_VERSION,
+        "code_commit": git_commit_hash(),
+        "checkpoint_epoch": PARTIAL_EPOCH,
+        "checkpoint_sha256": checkpoint_file_sha256(PARTIAL_EPOCH),
+        "encoder_hash": module_state_hash(model.encoder),
+        "projector_hash": module_state_hash(model.projector),
+        "split_hash": short_hash(manifest["episode_ids"]),
+        "action_pipeline_hash": short_hash({
+            "converter_lo": pipeline.converter.src_lo.round(6).tolist(),
+            "converter_hi": pipeline.converter.src_hi.round(6).tolist(),
+            "normalizer_mean": pipeline.normalizer.mean.round(6).tolist(),
+            "normalizer_std": pipeline.normalizer.std.round(6).tolist(),
+        }),
+        "alphabet_hash": alphabet.content_hash,
+        "u4_hash": short_hash(U8[:4].round(6).tolist()),
+        "selection_constants": {
+            "k_target_threshold": K_TARGET_THRESHOLD, "k_target": PILOT_K_TARGET,
+            "k_fallback_threshold": K_FALLBACK_THRESHOLD, "k_fallback": PILOT_K_FALLBACK,
+            "min_common_eligible": PILOT_MIN_COMMON_ELIGIBLE,
+            "n_occurrences_cap": N_OCCURRENCES_CAP, "per_episode_cap": PER_EPISODE_CAP,
+        },
+    }
+
+
+def save_v2_frozen_geometry(anchors: np.ndarray, candidates: list[dict], fingerprint: dict) -> None:
+    payload = {"anchors": anchors}
+    for c in candidates:
+        g = c["geometry"]
+        for key in ("T_basis", "V_basis", "W_basis", "B_N"):
+            payload[f"{c['id']}__{key}"] = g[key]
+        payload[f"{c['id']}__meta"] = np.array([c["region"], c["action"], g["q"], g["eta_c"]], dtype=object)
+        gg = c.get("global_geometry") or {}
+        if not gg.get("empty", True):
+            payload[f"{c['id']}__W_all_basis"] = gg["W_all_basis"]
+            payload[f"{c['id']}__B_N_all"] = gg["B_N_all"]
+    np.savez(FROZEN_GEOMETRY_NPZ, **payload)
+    FROZEN_GEOMETRY_FINGERPRINT_JSON.write_text(json.dumps({"fingerprint": fingerprint}, indent=2, default=str))
+
+
+def load_v2_frozen_geometry() -> dict | None:
+    if not (FROZEN_GEOMETRY_NPZ.exists() and FROZEN_GEOMETRY_FINGERPRINT_JSON.exists()):
+        return None
+    d = np.load(FROZEN_GEOMETRY_NPZ, allow_pickle=True)
+    anchors = d["anchors"]
+    ids = sorted({k.split("__")[0] for k in d.files if "__" in k})
+    candidates = []
+    for cid in ids:
+        meta = d[f"{cid}__meta"]
+        geometry = {"T_basis": d[f"{cid}__T_basis"], "V_basis": d[f"{cid}__V_basis"],
+                    "W_basis": d[f"{cid}__W_basis"], "B_N": d[f"{cid}__B_N"],
+                    "dim_T": int(d[f"{cid}__T_basis"].shape[0]), "dim_V": int(d[f"{cid}__V_basis"].shape[0]),
+                    "dim_W": int(d[f"{cid}__W_basis"].shape[0]), "dim_N": int(d[f"{cid}__B_N"].shape[0]),
+                    "q": int(meta[2]), "eta_c": float(meta[3])}
+        global_geometry = {"empty": True}
+        if f"{cid}__W_all_basis" in d.files:
+            global_geometry = {"empty": False, "W_all_basis": d[f"{cid}__W_all_basis"],
+                                "B_N_all": d[f"{cid}__B_N_all"]}
+        candidates.append({"id": cid, "region": int(meta[0]), "action": str(meta[1]),
+                              "geometry": geometry, "global_geometry": global_geometry})
+    fingerprint = json.loads(FROZEN_GEOMETRY_FINGERPRINT_JSON.read_text())["fingerprint"]
+    return {"anchors": anchors, "candidates": candidates, "fingerprint": fingerprint}
+
+
+def get_or_build_v2_candidates(manifest: dict, lever0_basis: dict, model, pipeline, alphabet: AlphabetLookup,
+                                  wall: WallClockBudget, fingerprint: dict) -> dict:
+    """Change D: NEVER loads v1's frozen geometry/retrieval caches (built
+    under a different checkpoint mixture, a different W=T-cap-V^perp
+    computation, and a different action-timing convention). Rebuilds
+    regions and candidates fresh under the corrected geometry every time
+    the fingerprint changes; a matching-fingerprint v2 cache IS reused
+    (this is expensive to rebuild -- a full replay_train/route_val scan --
+    and the fingerprint already proves nothing scientifically relevant
+    changed). "Select the first supported candidate in a frozen
+    deterministic order; do not force the old N00 identity to survive the
+    correction" (Change D) -- `build_regions_and_cells` without
+    `target_cells` already does exactly this: fresh eta_c-ranked candidates
+    N00/N01/N02, no comparison against any prior attempt's recorded values."""
+    cached = load_v2_frozen_geometry()
+    if cached is not None and cached["fingerprint"] == fingerprint:
+        print("  reusing persisted v2 frozen geometry (fingerprint match)", flush=True)
+        return {"status": "OK", "candidates": cached["candidates"], "anchors": cached["anchors"]}
+    if cached is not None:
+        print("  v2 frozen-geometry cache fingerprint MISMATCH -- discarding stale cache, rebuilding from scratch",
+              flush=True)
+    print("  building regions/candidates fresh under the corrected geometry (no v1 cache, no ATTEMPT1 "
+          "reference verification) ...", flush=True)
+    result = build_regions_and_cells(manifest, lever0_basis, model, pipeline, alphabet, wall)
+    if result["status"] != "OK":
+        return result
+    save_v2_frozen_geometry(result["anchors"], result["candidates"], fingerprint)
+    return {"status": "OK", "candidates": result["candidates"], "anchors": result["anchors"]}
+
+
+def freeze_encoder_and_projector(model) -> None:
+    """Change C: the shared `train_arm.freeze_encoder` (used by the six-arm
+    v6/v7 trees, out of this task's scope to modify) leaves `projector`
+    trainable -- but U_4/T/V/W/N are all defined in PROJECTOR-OUTPUT
+    coordinates, so projector updates during an arm would move the
+    coordinate system the frozen geometry was computed in. This LOCAL
+    function (used only by this pilot) freezes both."""
+    for p in model.encoder.parameters():
+        p.requires_grad_(False)
+    for p in model.projector.parameters():
+        p.requires_grad_(False)
+    model.encoder.eval()
+    model.projector.eval()
+
+
+def unfreeze_predictor_only(model) -> list[torch.nn.Parameter]:
+    """Change C: "Train only predictor, action_encoder, and pred_proj."""
+    params = []
+    for name, p in model.named_parameters():
+        if name.startswith("encoder.") or name.startswith("projector."):
+            p.requires_grad_(False)
+        else:
+            p.requires_grad_(True)
+            params.append(p)
+    return params
 
 
 def build_arm_dataset(segments: list[dict], replay_ds: ArmDataset, pipeline) -> ArmDataset:
-    """Exactly `len(segments)` curriculum samples (bug fix P0-1: built from
-    the EXACT selected (episode_id, t) segments, not re-windowed episode
-    IDs) plus the SAME shared `replay_ds` object for both arms (bug fix
-    P0-4: previously each arm built its OWN replay dataset sized to its OWN
-    curriculum length with the same seed -- identical only when the
-    requested sizes happened to match, which was never enforced). Passing
-    one shared `ArmDataset` guarantees byte-identical replay examples."""
+    """Exactly `len(segments)` curriculum samples (built from the EXACT
+    selected (episode_id, t) segments, not re-windowed episode IDs) plus the
+    SAME shared `replay_ds` object for both arms -- guarantees byte-identical
+    replay examples (Change F)."""
     curr_ds = build_dataset_from_segments(segments, pipeline)
     samples = curr_ds.samples + replay_ds.samples
     episode_ids = sorted(set(curr_ds.episode_ids) | set(replay_ds.episode_ids))
     return ArmDataset(samples=samples, pipeline=pipeline, episode_ids=episode_ids)
 
 
+def build_exact_k_replay_dataset(replay_train_ids: list[int], k_use: int, pipeline, seed: int) -> ArmDataset:
+    """Change F item 3: "Build exactly K replay samples, truncate
+    deterministically, and assert the count." `build_replay_dataset` targets
+    `k_use` but samples whole EPISODES (8 windows each) -- ceil-dividing can
+    overshoot; this truncates the resulting sample list to EXACTLY `k_use`
+    (deterministic: whatever order `build_replay_dataset` produced, which is
+    itself seeded) and asserts the count, rather than silently training on a
+    different-sized replay set than declared."""
+    ds = build_replay_dataset(replay_train_ids, k_use, pipeline, seed=seed)
+    if len(ds.samples) < k_use:
+        raise RuntimeError(
+            f"IMPLEMENTATION_FAILURE: could only build {len(ds.samples)}/{k_use} replay samples from "
+            f"{len(replay_train_ids)} replay_train episodes")
+    samples = ds.samples[:k_use]
+    episode_ids = sorted(set(int(s["episode"]) for s in samples))
+    out = ArmDataset(samples=samples, pipeline=pipeline, episode_ids=episode_ids)
+    assert len(out.samples) == k_use, "IMPLEMENTATION_FAILURE: exact-K replay truncation produced the wrong count"
+    return out
+
+
 def assert_segments_survive(dataset: ArmDataset, frozen_segment_ids: set[tuple[int, int]], n_curriculum: int) -> None:
-    """Required invariant (code audit 2026-09-06, section 9.3): every
-    curriculum sample's (episode, position) must be exactly one of the
-    frozen selected segments -- 100%, not merely high. Checks only the
-    first `n_curriculum` samples (the curriculum portion; replay samples
-    are drawn from `replay_train` and are never expected to be in
-    `frozen_segment_ids`)."""
+    """Required invariant (TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md section
+    3, Check 3 / preflight): every curriculum sample's (episode, position)
+    must be exactly one of the frozen selected segments -- 100%, not merely
+    high. Checks only the first `n_curriculum` samples (the curriculum
+    portion; replay samples are drawn from `replay_train` and are never
+    expected to be in `frozen_segment_ids`)."""
     hits = sum(1 for s in dataset.samples[:n_curriculum] if (s["episode"], s["pos"]) in frozen_segment_ids)
     if hits != n_curriculum:
         raise RuntimeError(
@@ -120,13 +290,10 @@ def assert_segments_survive(dataset: ArmDataset, frozen_segment_ids: set[tuple[i
 
 
 def paired_eid_arrays(per_episode_a: dict, per_episode_b: dict) -> tuple:
-    """Bug fix, code audit 2026-09-06 (P0-5): the two arms' E_N values used
-    to be concatenated by ARRAY POSITION (`dict.values()` order), correct
-    only if both `per_episode` dicts happen to insert episodes in identical
-    order -- an unstated invariant of `evaluate_E_W`'s iteration, never
-    enforced. This aligns explicitly by episode_id and fails loudly if the
-    two arms' evaluated episode sets ever diverge, instead of silently
-    mispairing two different episodes' errors."""
+    """Explicit episode_id pairing (not array-position pairing) between two
+    arms' per-episode E_N dicts -- fails loudly if the two arms' evaluated
+    episode sets ever diverge, instead of silently mispairing two different
+    episodes' errors."""
     common = sorted(set(per_episode_a) & set(per_episode_b))
     if len(common) != len(per_episode_a) or len(common) != len(per_episode_b):
         raise RuntimeError(
@@ -136,51 +303,69 @@ def paired_eid_arrays(per_episode_a: dict, per_episode_b: dict) -> tuple:
             np.array([per_episode_b[e]["E_W"] for e in common]))
 
 
-def hierarchical_paired_bootstrap_ci(diffs_by_seed: dict, seed: int, n_boot: int = 1000) -> tuple:
-    """Two-level (seed, then episode) paired bootstrap (code audit
-    2026-09-06, P0-5): resamples SEEDS with replacement, then within each
-    resampled seed resamples ITS OWN episodes with replacement, rather than
-    pooling all seeds x episodes into one i.i.d. bag. Both seeds trained the
-    SAME two frozen curricula end-to-end, so within a seed the episode-level
-    errors share that seed's training trajectory -- pooling across seeds
-    treats them as independent draws and understates variance. With only
-    `len(SEEDS)==2` seeds this resampling is itself coarse (4 possible seed
-    pairs); report alongside the per-seed CIs, not as a substitute for a
-    larger seed count."""
+def pair_level_bootstrap_ci(deltas: list[float], seed: int, n_boot: int = 2000) -> tuple:
+    """PRIMARY interval for the decision rule (section 4: "Episode-level
+    resampling may be included as a secondary conditional interval, but
+    must not replace the five paired experimental units") -- resamples the
+    N_PAIRS delta_j values themselves, WITH replacement. With N_PAIRS=5 this
+    is necessarily coarse (only a handful of distinct resamples exist);
+    report alongside the raw 5 values and their sign count, not as a
+    substitute for them."""
+    arr = np.array(deltas)
     rng = np.random.default_rng(seed)
-    seeds = sorted(diffs_by_seed)
-    n_seeds = len(seeds)
-    point = float(np.mean([diffs_by_seed[s].mean() for s in seeds]))
-    boots = []
-    for _ in range(n_boot):
-        resampled = rng.integers(0, n_seeds, size=n_seeds)
-        seed_means = []
-        for si in resampled:
-            d = diffs_by_seed[seeds[si]]
-            seed_means.append(float(d[rng.integers(0, len(d), size=len(d))].mean()))
-        boots.append(float(np.mean(seed_means)))
-    boots = np.array(boots)
-    return point, float(np.quantile(boots, 0.025)), float(np.quantile(boots, 0.975))
+    n = len(arr)
+    boots = np.array([arr[rng.integers(0, n, size=n)].mean() for _ in range(n_boot)])
+    return float(arr.mean()), float(np.quantile(boots, 0.025)), float(np.quantile(boots, 0.975))
+
+
+def reset_all_rngs(seed: int) -> None:
+    """Change E: "reset Python, NumPy, PyTorch CPU, and all CUDA RNGs to the
+    pair seed; enable deterministic CUDA/PyTorch behaviour where supported."
+    The LOCAL `torch.Generator` used for the batch permutation already makes
+    batch ORDER identical between the two arms of a pair, but the LeWM
+    predictor may use dropout, which consumes GLOBAL torch RNG state -- if
+    that state has drifted differently between the two arms (e.g. from
+    unrelated calls elsewhere in the process), their dropout masks would
+    differ even with an identical permutation. Resetting every RNG this
+    process could plausibly touch, right before each arm, removes that
+    degree of freedom entirely."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # warn_only: this codebase calls into a third-party pretrained ViT/JEPA
+    # stack that may include ops without a deterministic CUDA kernel: fail
+    # LOUDLY via a printed warning rather than crashing the whole run over an
+    # op we don't control and cannot swap out.
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def run_checkpointed_training(model, theta0_state: dict, dataset: ArmDataset, seed: int,
                                  checkpoints: list[int], ckpt_dir: Path) -> dict:
-    """ONE continuous training run per (arm, seed) -- exactly the four
-    required (2 arms x 2 seeds) -- pausing to snapshot model state at each
-    update count in `checkpoints` without resetting, so the 500-update
-    primary endpoint and its 200-update diagnostic point come from the SAME
-    trajectory, not two separate runs. One whole-run retry (unchanged
-    scientific parameters) on OOM or any other exception, per the pilot's
-    "one implementation retry" allowance."""
+    """ONE continuous training run per (arm, pair) -- pausing to snapshot
+    model state at each update count in `checkpoints` without resetting, so
+    the 500-update primary endpoint and its 200-update diagnostic point come
+    from the SAME trajectory, not two separate runs (the 200-update value is
+    logged as a diagnostic only -- it never routes or stops training, per
+    section 4). Change E: full RNG reset (not just the local permutation
+    generator) at the start of every attempt, and no per-arm batch-size
+    change -- OOM triggers one whole-run retry at the SAME batch size;
+    a second failure propagates as an implementation failure rather than
+    silently shrinking the batch for only one arm of a pair."""
     def _attempt():
+        reset_all_rngs(seed)
         model.load_state_dict(theta0_state)
         model.train()
-        freeze_encoder(model)
-        params = unfreeze_trainable(model)
+        freeze_encoder_and_projector(model)
+        params = unfreeze_predictor_only(model)
         opt = torch.optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
         gen = torch.Generator().manual_seed(seed)
         n = len(dataset.samples)
-        encoder_before = copy.deepcopy({k: v for k, v in model.state_dict().items() if k.startswith("encoder.")})
+        frozen_before = copy.deepcopy({k: v for k, v in model.state_dict().items()
+                                          if k.startswith("encoder.") or k.startswith("projector.")})
 
         step = 0
         results = {}
@@ -204,13 +389,11 @@ def run_checkpointed_training(model, theta0_state: dict, dataset: ArmDataset, se
                 ctx_emb, ctx_act = emb[:, :HISTORY_SIZE], act_emb[:, :HISTORY_SIZE]
                 tgt_emb = emb[:, 1:]
                 pred_emb = model.predict(ctx_emb, ctx_act)
-                # Bug fix, code audit 2026-09-06 (loss dilution): only the
-                # LAST predicted step corresponds to the actual selected
-                # (episode_id, t) transition retrieval scored and the
-                # curriculum was built on; averaging the loss over all
-                # HISTORY_SIZE predicted steps mixes in unselected, purely
-                # incidental context-window predictions and dilutes the
-                # training signal the curriculum was meant to concentrate.
+                # Only the LAST predicted step corresponds to the actual
+                # selected (episode_id, t) transition retrieval scored and
+                # the curriculum was built on; averaging over all HISTORY_SIZE
+                # predicted steps would mix in unselected, incidental
+                # context-window predictions and dilute the training signal.
                 loss = (pred_emb[:, -1] - tgt_emb[:, -1]).pow(2).mean()
                 if torch.isnan(loss):
                     raise FloatingPointError("NaN loss")
@@ -226,16 +409,19 @@ def run_checkpointed_training(model, theta0_state: dict, dataset: ArmDataset, se
                     torch.save(model.state_dict(), ckpt_path)
                     results[cp] = {"step": step, "loss": loss_val, "checkpoint": str(ckpt_path)}
 
-        encoder_after = {k: v for k, v in model.state_dict().items() if k.startswith("encoder.")}
-        for k in encoder_before:
-            if not torch.equal(encoder_before[k], encoder_after[k]):
-                raise RuntimeError(f"IMPLEMENTATION_FAILURE: encoder tensor {k} changed despite freeze")
+        frozen_after = {k: v for k, v in model.state_dict().items()
+                           if k.startswith("encoder.") or k.startswith("projector.")}
+        for k in frozen_before:
+            if not torch.equal(frozen_before[k], frozen_after[k]):
+                raise RuntimeError(f"IMPLEMENTATION_FAILURE: frozen tensor {k} changed despite freeze "
+                                     f"(Change C requires encoder AND projector frozen)")
         return results
 
     try:
         return _attempt()
     except (torch.cuda.OutOfMemoryError, FloatingPointError) as e:  # noqa: BLE001
-        print(f"    [retry] {type(e).__name__}: {e} -- one whole-run retry, unchanged parameters", flush=True)
+        print(f"    [retry] {type(e).__name__}: {e} -- one whole-run retry, SAME batch size, unchanged "
+              f"parameters (Change E: no per-arm batch-size change)", flush=True)
         torch.cuda.empty_cache()
         return _attempt()
 
@@ -250,9 +436,6 @@ def _eval_all(model, eval_slice: dict, guard_slice: dict, pipeline, B_N, W_basis
     gg_full = evaluate_E_W(model, guard_slice, pipeline, np.eye(D), U8, B8)
     return {
         "E_N": np.array([v["E_W"] for v in ev_n["per_episode"].values()]) if ev_n["per_episode"] else np.zeros(1),
-        # Bug fix, code audit 2026-09-06 (P0-5): keep the eid-keyed dict too,
-        # so cross-arm comparisons can pair explicitly by episode_id instead
-        # of trusting `dict.values()` insertion order to match between calls.
         "E_N_per_episode": ev_n["per_episode"],
         "E_all": np.array([v["E_all"] for v in ev_full["per_episode"].values()]) if ev_full["per_episode"] else np.zeros(1),
         "E_W": np.array([v["E_W"] for v in ev_w["per_episode"].values()]) if ev_w["per_episode"] else np.zeros(1),
@@ -267,47 +450,56 @@ def write_pilot_report(status: str, extra: dict, wall: WallClockBudget) -> None:
     payload = {"status": status, "timestamp": now_iso(), "wall_hours_used": wall.elapsed_hours(),
                  "wall_hours_budget": MAX_WALL_HOURS, **extra}
     write_atomic(METRICS_PATH, payload)
-    md = [f"# Two-arm feasibility pilot", "", f"**Status:** {status}", "",
+    md = [f"# Two-arm feasibility pilot (v2)", "", f"**Status:** {status}", "",
            f"Wall-clock used: {payload['wall_hours_used']:.2f}h / {MAX_WALL_HOURS}h", ""]
     if "reason" in extra:
         md += [f"Reason: {extra['reason']}", ""]
     REPORT_PATH.write_text("\n".join(md))
     copy_to_downloads(METRICS_PATH, REPORT_PATH, MANIFEST_PATH)
-    print(f"\n=== PILOT FINAL: {status} ({wall.elapsed_hours():.2f}h) ===", flush=True)
+    print(f"\n=== PILOT v2 FINAL: {status} ({wall.elapsed_hours():.2f}h) ===", flush=True)
 
 
 def main() -> int:
+    mark_v1_invalidated()
     wall = WallClockBudget(MAX_WALL_HOURS)
-    print(f"=== need_two_arm_pilot INIT ({now_iso()}) ===", flush=True)
+    print(f"=== need_two_arm_pilot v2 INIT ({now_iso()}) ===", flush=True)
     manifest = build_splits()
     assert_disjoint_splits(manifest)
     lever0_basis = load_lever0_basis()
     alphabet = AlphabetLookup()
-    model = load_partial_model()
+    model = load_partial_model()   # epoch 7 -- see checkpoints.PARTIAL_EPOCH
     theta0_state = copy.deepcopy(model.state_dict())
-    # Bug fix, code audit 2026-09-06 (P0-6): the converter used to be fit on
-    # route_val + replay_train, i.e. partly on the very data the pilot later
-    # evaluates on (`route_val` backs `eval_slice`) -- any route_val-specific
-    # action-statistics leak into the (frozen, reused-everywhere) pipeline
-    # before evaluation even begins. Fit on replay_train only.
+    # Fit on replay_train only (Change P0-6, carried forward): route_val backs
+    # eval_slice, so fitting on it too would leak eval-set action statistics
+    # into the (frozen, reused-everywhere) pipeline before evaluation begins.
     pipeline = fit_pipeline(manifest["episode_ids"]["replay_train"])
 
-    print("=== reusing frozen E0 geometry (persisted cache, or verified reconstruction) ===", flush=True)
-    build_result = get_or_reconstruct_frozen_candidates(manifest, lever0_basis, model, pipeline, alphabet, wall)
+    U8, B8 = load_frozen_directions()
+    fingerprint = compute_fingerprint(model, pipeline, alphabet, U8, manifest)
+    print(f"  fingerprint: checkpoint_sha256={fingerprint['checkpoint_sha256'][:16]}... "
+          f"encoder_hash={fingerprint['encoder_hash'][:16]}... code_commit={fingerprint['code_commit'][:12]}",
+          flush=True)
+
+    print("=== building v2 region/candidate geometry (epoch-7 coordinates, corrected W=T∩V^perp, "
+          "no v1 cache) ===", flush=True)
+    build_result = get_or_build_v2_candidates(manifest, lever0_basis, model, pipeline, alphabet, wall, fingerprint)
     if build_result["status"] != "OK":
-        write_pilot_report("RETRIEVAL_INFEASIBLE", {"reason": f"E0 build/verification failed: {build_result['status']}"}, wall)
+        write_pilot_report("RETRIEVAL_INFEASIBLE", {"reason": f"E0 build failed: {build_result['status']}"}, wall)
         return 1
     candidates = build_result["candidates"]
     anchors = build_result["anchors"]
-    print(f"  frozen candidates (order N00->N01->N02): "
-          f"{[(c['id'], c['region'], c['action']) for c in candidates]}", flush=True)
+    print(f"  candidates (frozen deterministic order, by eta_c descending -- NOT forced to match any prior "
+          f"attempt's N00 identity): {[(c['id'], c['region'], c['action']) for c in candidates]}", flush=True)
 
-    print(f"=== targeted retrieval (pilot cascade: >={K_TARGET_THRESHOLD}->K={K_TARGET}, "
-          f">={K_FALLBACK_THRESHOLD}->K={K_FALLBACK}), {RETRIEVAL_MAX_MINUTES:.0f}-min cap ===", flush=True)
+    print(f"=== targeted retrieval (pilot cascade: >={K_TARGET_THRESHOLD}->K={PILOT_K_TARGET}, "
+          f">={K_FALLBACK_THRESHOLD}->K={PILOT_K_FALLBACK}), fixed {N_OCCURRENCES_CAP}-occurrence SHA-ordered "
+          f"prefix, {RETRIEVAL_MAX_MINUTES:.0f}-min SAFETY ABORT, per-episode cap={PER_EPISODE_CAP} ===",
+          flush=True)
     curricula_by_cell, retrieval_stats = run_targeted_retrieval(
         candidates, manifest["episode_ids"]["retrieval_pool"], anchors, lever0_basis, pipeline, model, alphabet,
-        seed=SEED, max_minutes=RETRIEVAL_MAX_MINUTES, min_common_eligible=MIN_COMMON_ELIGIBLE,
-        k_target_threshold=K_TARGET_THRESHOLD, k_target=K_TARGET, k_fallback=K_FALLBACK)
+        seed=SEED, max_minutes=RETRIEVAL_MAX_MINUTES, min_common_eligible=PILOT_MIN_COMMON_ELIGIBLE,
+        k_target_threshold=K_TARGET_THRESHOLD, k_target=PILOT_K_TARGET, k_fallback=PILOT_K_FALLBACK,
+        n_occurrences_cap=N_OCCURRENCES_CAP, per_episode_cap=PER_EPISODE_CAP, require_exact_k=True)
 
     chosen = None
     for cand in candidates:   # frozen order: first retrieval-feasible cell wins, not best-scoring
@@ -323,45 +515,39 @@ def main() -> int:
     cell = (chosen["region"], chosen["action"])
     curricula = curricula_by_cell[cell]
     need_curric, random_curric = curricula["conditional_need"], curricula["random_traj"]
-
-    # Bug fix, code audit 2026-09-06 (P0-4): freeze both arms to the SAME
-    # common K = min(selected segments) instead of trusting each arm's own
-    # (possibly-starved) `attrition["segments_selected"]` count to already
-    # match -- they were never asserted equal.
-    need_segments, random_segments, k_use = freeze_common_k_segments(
-        need_curric["segments"], random_curric["segments"])
-    if k_use < MIN_COMMON_K:
-        write_pilot_report(
-            "RETRIEVAL_INFEASIBLE",
-            {"reason": f"common K={k_use} < MIN_COMMON_K={MIN_COMMON_K} after matching arm cardinality",
-             "need_segments_available": len(need_curric["segments"]),
-             "random_segments_available": len(random_curric["segments"])},
-            wall)
-        return 1
-    print(f"  chosen: {chosen['id']} (region={chosen['region']}, action={chosen['action']}); "
-          f"need_curriculum={need_curric['attrition']}; matched_random={random_curric['attrition']}; "
-          f"common K used (after matching)={k_use}", flush=True)
+    # run_targeted_retrieval(require_exact_k=True) already guarantees every
+    # arm has EXACTLY k_use segments (Change F items 2-4) -- no post-hoc
+    # min()-truncation ("MIN_COMMON_K") needed or permitted here anymore.
+    need_segments = need_curric["segments"]
+    k_use = len(need_segments)
+    assert len(random_curric["segments"]) == k_use, (
+        "IMPLEMENTATION_FAILURE: require_exact_k=True did not produce matched arm cardinality")
+    traj_pool = random_curric["_pool_for_resampling"]
+    print(f"  chosen: {chosen['id']} (region={chosen['region']}, action={chosen['action']}); K={k_use}; "
+          f"need_curriculum={need_curric['attrition']}; random_traj eligible pool={len(traj_pool)}", flush=True)
 
     need_segment_ids = {(int(s["eid"]), int(s["t"])) for s in need_segments}
-    random_segment_ids = {(int(s["eid"]), int(s["t"])) for s in random_segments}
     need_episode_ids = sorted({eid for eid, _ in need_segment_ids})
-    random_episode_ids = sorted({eid for eid, _ in random_segment_ids})
 
     write_atomic(MANIFEST_PATH, {
-        "timestamp": now_iso(), "chosen_candidate": chosen["id"], "region": chosen["region"],
-        "action": chosen["action"], "candidates_considered_order": [c["id"] for c in candidates],
-        "k_cascade": {"k_target_threshold": K_TARGET_THRESHOLD, "k_target": K_TARGET,
-                        "k_fallback_threshold": K_FALLBACK_THRESHOLD, "k_fallback": K_FALLBACK,
-                        "min_common_eligible": MIN_COMMON_ELIGIBLE},
-        "retrieval_stats": retrieval_stats, "k_use_common": k_use,
-        "need_curriculum": {"segments": sorted(need_segment_ids), "attrition": need_curric["attrition"]},
-        "matched_random": {"segments": sorted(random_segment_ids), "attrition": random_curric["attrition"]},
-        "segment_overlap": len(need_segment_ids & random_segment_ids),
-        "episode_overlap": len(set(need_episode_ids) & set(random_episode_ids)),
+        "timestamp": now_iso(), "fingerprint": fingerprint,
+        "chosen_candidate": chosen["id"], "region": chosen["region"], "action": chosen["action"],
+        "candidates_considered_order": [c["id"] for c in candidates],
+        "k_cascade": {"k_target_threshold": K_TARGET_THRESHOLD, "k_target": PILOT_K_TARGET,
+                        "k_fallback_threshold": K_FALLBACK_THRESHOLD, "k_fallback": PILOT_K_FALLBACK,
+                        "min_common_eligible": PILOT_MIN_COMMON_ELIGIBLE, "per_episode_cap": PER_EPISODE_CAP,
+                        "n_occurrences_cap": N_OCCURRENCES_CAP},
+        "retrieval_stats": retrieval_stats, "k_use": k_use,
+        "need_curriculum": {"segments": [{"eid": s["eid"], "t": s["t"], "region": s["region"], "letter": s["letter"],
+                                              "score": s["score"], "content_hash": s["content_hash"]}
+                                             for s in need_segments],
+                              "attrition": need_curric["attrition"]},
+        "random_traj_pool_size": len(traj_pool),
+        "n_pairs": N_PAIRS, "pair_seeds": PAIR_SEEDS,
     })
 
     eval_slice = build_cell_eval_slice(manifest["episode_ids"]["route_val"], chosen["region"], chosen["action"],
-                                          anchors, lever0_basis, pipeline, alphabet, seed=SEED + 1)
+                                          anchors, lever0_basis, pipeline, alphabet, seed=SEED + 1, model=model)
     guard_ids = manifest["episode_ids"]["global_guard"][:80]
     guard_slice = build_eval_slice(guard_ids, n_per_episode=4, seed=SEED + 2)
     try:
@@ -373,20 +559,17 @@ def main() -> int:
     print(f"  eval_slice: {len(eval_slice['samples'])} samples; guard_slice: {len(guard_slice['samples'])} samples",
           flush=True)
 
-    # ONE shared replay dataset, sized to the common K, reused byte-for-byte
-    # by both arms (bug fix P0-4).
+    # ONE shared replay dataset, sized to EXACTLY k_use, reused byte-for-byte
+    # by both arms across ALL 5 pairs (Change F item 3).
     replay_seed = SEED + 100
-    replay_ds = build_replay_dataset(manifest["episode_ids"]["replay_train"], k_use, pipeline, seed=replay_seed)
+    replay_ds = build_exact_k_replay_dataset(manifest["episode_ids"]["replay_train"], k_use, pipeline,
+                                                 seed=replay_seed)
     need_ds = build_arm_dataset(need_segments, replay_ds, pipeline)
-    random_ds = build_arm_dataset(random_segments, replay_ds, pipeline)
     assert_segments_survive(need_ds, need_segment_ids, len(need_segments))
-    assert_segments_survive(random_ds, random_segment_ids, len(random_segments))
     print(f"  need_curriculum dataset: {len(need_ds.samples)} samples "
-          f"({len(need_segments)} curriculum + {len(replay_ds.samples)} shared replay); "
-          f"matched_random dataset: {len(random_ds.samples)} samples "
-          f"({len(random_segments)} curriculum + {len(replay_ds.samples)} shared replay)", flush=True)
+          f"({len(need_segments)} curriculum + {len(replay_ds.samples)} shared replay, fixed across all "
+          f"{N_PAIRS} pairs)", flush=True)
 
-    U8, B8 = load_frozen_directions()
     geom = chosen["geometry"]
     B_N, W_basis, V_basis = geom["B_N"], geom["W_basis"], geom["V_basis"]
 
@@ -397,13 +580,24 @@ def main() -> int:
           f"guard_E_all={pre['guard_E_all']:.4f} guard_effrank={pre['guard_effrank']:.3f}", flush=True)
 
     node_dir = PILOT_DIR / chosen["id"]
-    per_seed = {"need_curriculum": {}, "matched_random": {}}
-    for seed in SEEDS:
-        for arm_name, ds in (("need_curriculum", need_ds), ("matched_random", random_ds)):
-            print(f"  training arm={arm_name} seed={seed} ({N_UPDATES_PRIMARY} updates, "
-                  f"diagnostic at {N_UPDATES_DIAGNOSTIC})...", flush=True)
-            ckpt_dir = node_dir / arm_name
-            cps = run_checkpointed_training(model, theta0_state, ds, seed,
+    per_pair = {"need_curriculum": {}, "matched_random": {}}
+    random_curricula_by_pair = {}
+    for pair_idx in PAIR_SEEDS:
+        # Section 4: "an independently sampled matched-random curriculum" per
+        # pair, while need_curriculum's segments stay fixed across all pairs.
+        resample_seed = stable_seed(SEED, "resample", pair_idx)
+        random_curric_j = resample_random_traj_curriculum(traj_pool, k_use, seed=resample_seed,
+                                                               per_episode_cap=PER_EPISODE_CAP)
+        random_curricula_by_pair[pair_idx] = random_curric_j
+        random_ds_j = build_arm_dataset(random_curric_j["segments"], replay_ds, pipeline)
+        random_segment_ids_j = {(int(s["eid"]), int(s["t"])) for s in random_curric_j["segments"]}
+        assert_segments_survive(random_ds_j, random_segment_ids_j, k_use)
+
+        for arm_name, ds in (("need_curriculum", need_ds), ("matched_random", random_ds_j)):
+            print(f"  pair={pair_idx} training arm={arm_name} seed={PAIR_SEEDS[pair_idx]} "
+                  f"({N_UPDATES_PRIMARY} updates, diagnostic at {N_UPDATES_DIAGNOSTIC})...", flush=True)
+            ckpt_dir = node_dir / arm_name / f"pair{pair_idx}"
+            cps = run_checkpointed_training(model, theta0_state, ds, PAIR_SEEDS[pair_idx],
                                                 [N_UPDATES_DIAGNOSTIC, N_UPDATES_PRIMARY], ckpt_dir)
 
             model.load_state_dict(torch.load(cps[N_UPDATES_PRIMARY]["checkpoint"], map_location=DEVICE))
@@ -414,118 +608,112 @@ def main() -> int:
             diag_ev = evaluate_E_W(model, eval_slice, pipeline, B_N, U8, B8)
             diag_E_N = float(np.mean([v["E_W"] for v in diag_ev["per_episode"].values()])) if diag_ev["per_episode"] else float("nan")
 
-            per_seed[arm_name][seed] = {**post, "diagnostic_200_E_N_mean": diag_E_N,
-                                           "loss_primary": cps[N_UPDATES_PRIMARY]["loss"]}
-            print(f"    arm={arm_name} seed={seed}: E_N_mean={np.mean(post['E_N']):.4f} "
+            per_pair[arm_name][pair_idx] = {**post, "diagnostic_200_E_N_mean": diag_E_N,
+                                                "loss_primary": cps[N_UPDATES_PRIMARY]["loss"]}
+            print(f"    pair={pair_idx} arm={arm_name}: E_N_mean={np.mean(post['E_N']):.4f} "
                   f"(diagnostic@200={diag_E_N:.4f}) guard_E_all={post['guard_E_all']:.4f} "
                   f"guard_effrank={post['guard_effrank']:.3f} (wall {wall.elapsed_hours():.2f}h)", flush=True)
             if wall.exhausted():
-                write_pilot_report("TIME_BUDGET_EXHAUSTED", {"reason": "wall-clock exhausted mid-training"}, wall)
+                write_pilot_report("TIME_BUDGET_EXHAUSTED",
+                                      {"reason": f"wall-clock exhausted mid-training at pair={pair_idx} "
+                                                   f"arm={arm_name}"}, wall)
                 return 1
 
     print("=== computing metrics ===", flush=True)
-    gains, per_seed_E_N_mean = {}, {"need_curriculum": {}, "matched_random": {}}
+    gains, per_pair_E_N_mean = {}, {"need_curriculum": {}, "matched_random": {}}
     for arm in ("need_curriculum", "matched_random"):
-        per_seed_gain = {}
-        for seed in SEEDS:
-            e_n_mean = float(np.mean(per_seed[arm][seed]["E_N"]))
-            per_seed_E_N_mean[arm][seed] = e_n_mean
-            per_seed_gain[seed] = (pre_E_N - e_n_mean) / max(pre_E_N, 1e-8)
-        gains[arm] = per_seed_gain
+        pair_gain = {}
+        for j in PAIR_SEEDS:
+            e_n_mean = float(np.mean(per_pair[arm][j]["E_N"]))
+            per_pair_E_N_mean[arm][j] = e_n_mean
+            pair_gain[j] = (pre_E_N - e_n_mean) / max(pre_E_N, 1e-8)
+        gains[arm] = pair_gain
 
-    seed_signs = {seed: per_seed_E_N_mean["need_curriculum"][seed] < per_seed_E_N_mean["matched_random"][seed]
-                    for seed in SEEDS}
-    need_wins_both = all(seed_signs.values())
-    random_wins_both = not any(seed_signs.values())
-    mean_G_need = float(np.mean(list(gains["need_curriculum"].values())))
-    mean_G_random = float(np.mean(list(gains["matched_random"].values())))
-    per_seed_delta_G = {seed: gains["need_curriculum"][seed] - gains["matched_random"][seed] for seed in SEEDS}
-    mean_delta_G = float(np.mean(list(per_seed_delta_G.values())))
+    deltas = [gains["need_curriculum"][j] - gains["matched_random"][j] for j in PAIR_SEEDS]
+    mean_delta = float(np.mean(deltas))
+    n_positive = sum(1 for d in deltas if d > 0)
+    n_negative = sum(1 for d in deltas if d < 0)
+    ci_mean, ci_lo, ci_hi = pair_level_bootstrap_ci(deltas, seed=SEED + 9)
 
-    # Bug fix, code audit 2026-09-06 (P0-5): explicit eid-keyed pairing per
-    # seed, then a hierarchical (seed-then-episode) bootstrap instead of
-    # pooling all seeds x episodes as one i.i.d. bag.
-    diffs_by_seed = {}
-    per_seed_ci = {}
-    for s in SEEDS:
+    # Secondary, episode-level (not pair-level) interval -- explicit eid
+    # pairing per pair, then a hierarchical (pair-then-episode) bootstrap.
+    # Reported alongside, never in place of the primary 5-pair-level CI
+    # above (section 4: "must not replace the five paired experimental units").
+    diffs_by_pair, per_pair_ci = {}, {}
+    for j in PAIR_SEEDS:
         random_arr, need_arr = paired_eid_arrays(
-            per_seed["matched_random"][s]["E_N_per_episode"], per_seed["need_curriculum"][s]["E_N_per_episode"])
-        diffs_by_seed[s] = random_arr - need_arr
-        pm, plo, phi = paired_bootstrap_ci(random_arr, need_arr, seed=SEED + 9 + s)
-        per_seed_ci[s] = {"mean": pm, "ci95": [plo, phi], "n_episodes": int(len(random_arr))}
-    ci_mean, ci_lo, ci_hi = hierarchical_paired_bootstrap_ci(diffs_by_seed, seed=SEED + 9)
+            per_pair["matched_random"][j]["E_N_per_episode"], per_pair["need_curriculum"][j]["E_N_per_episode"])
+        diffs_by_pair[j] = random_arr - need_arr
+        pm, plo, phi = paired_bootstrap_ci(random_arr, need_arr, seed=SEED + 90 + j)
+        per_pair_ci[j] = {"mean": pm, "ci95": [plo, phi], "n_episodes": int(len(random_arr))}
 
     need_gg_regression = [
-        (per_seed["need_curriculum"][s]["guard_E_all"] - pre["guard_E_all"]) / max(pre["guard_E_all"], 1e-8)
-        for s in SEEDS]
+        (per_pair["need_curriculum"][j]["guard_E_all"] - pre["guard_E_all"]) / max(pre["guard_E_all"], 1e-8)
+        for j in PAIR_SEEDS]
     need_effrank_drop = [
-        (pre["guard_effrank"] - per_seed["need_curriculum"][s]["guard_effrank"]) / max(pre["guard_effrank"], 1e-8)
-        for s in SEEDS]
+        (pre["guard_effrank"] - per_pair["need_curriculum"][j]["guard_effrank"]) / max(pre["guard_effrank"], 1e-8)
+        for j in PAIR_SEEDS]
     global_ok = all(r <= GLOBAL_REGRESSION_MAX for r in need_gg_regression)
     effrank_ok = all(d <= EFFRANK_DROP_MAX for d in need_effrank_drop)
+    guard_ok = global_ok and effrank_ok
 
-    if not need_wins_both and not random_wins_both:
-        label = "INCONCLUSIVE"
-    elif random_wins_both:
+    # DECISION RULE (TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md section 4) --
+    # this replaces v1's STRONG/FEASIBILITY/BELOW_THRESHOLD tiering entirely.
+    if mean_delta > 0 and n_positive >= MIN_PAIRS_FOR_SIGN and guard_ok:
+        label = "TWO_ARM_POSITIVE"
+    elif mean_delta < 0 and n_negative >= MIN_PAIRS_FOR_SIGN and guard_ok:
         label = "TWO_ARM_NEGATIVE"
     else:
-        criteria = {"need_wins_both_seeds": need_wins_both, "mean_G_need_ge_0.02": mean_G_need >= MIN_RELATIVE_GAIN,
-                      "mean_delta_G_positive": mean_delta_G > 0, "global_regression_ok": global_ok,
-                      "effrank_ok": effrank_ok}
-        if all(criteria.values()):
-            label = "STRONG_TWO_ARM_SIGNAL" if ci_lo > 0 else "TWO_ARM_FEASIBILITY_SIGNAL"
-        else:
-            label = "BELOW_THRESHOLD"
+        label = "INCONCLUSIVE"
 
     metrics = {
         "status": label, "timestamp": now_iso(), "wall_hours_used": wall.elapsed_hours(),
         "wall_hours_budget": MAX_WALL_HOURS, "chosen_candidate": chosen["id"], "region": chosen["region"],
-        "action": chosen["action"], "k_use": k_use, "pre_E_N": pre_E_N, "pre_E_all": float(np.mean(pre["E_all"])),
+        "action": chosen["action"], "k_use": k_use, "n_pairs": N_PAIRS,
+        "pre_E_N": pre_E_N, "pre_E_all": float(np.mean(pre["E_all"])),
         "pre_guard_E_all": pre["guard_E_all"], "pre_guard_effrank": pre["guard_effrank"],
-        "gains_G": gains, "mean_G_need": mean_G_need, "mean_G_random": mean_G_random,
-        "per_seed_delta_G": per_seed_delta_G, "mean_delta_G": mean_delta_G,
-        "seed_signs_need_beats_random": seed_signs,
-        # Renamed from `paired_advantage_random_minus_need` (code audit
-        # 2026-09-06, P0-5): now a hierarchical (seed-then-episode) bootstrap
-        # over EXPLICITLY eid-paired per-seed differences, not a pooled
-        # i.i.d. bootstrap over positionally-concatenated arrays. Per-seed
-        # CIs are reported alongside since n_seeds=2 makes the hierarchical
-        # resample itself coarse.
-        "paired_advantage_random_minus_need_hierarchical": {"mean": ci_mean, "ci95": [ci_lo, ci_hi]},
-        "paired_advantage_random_minus_need_per_seed": per_seed_ci,
-        "need_global_regression_per_seed": need_gg_regression, "need_effrank_drop_per_seed": need_effrank_drop,
-        "global_regression_ok": global_ok, "effrank_ok": effrank_ok,
-        "segment_overlap": len(need_segment_ids & random_segment_ids),
-        "episode_overlap": len(set(need_episode_ids) & set(random_episode_ids)),
-        "per_seed_detail": {
-            arm: {str(s): {"E_N_mean": float(np.mean(per_seed[arm][s]["E_N"])),
-                             "E_all_mean": float(np.mean(per_seed[arm][s]["E_all"])),
-                             "E_W_mean": float(np.mean(per_seed[arm][s]["E_W"])),
-                             "E_V_mean": float(np.mean(per_seed[arm][s]["E_V"])),
-                             "diagnostic_200_E_N_mean": per_seed[arm][s]["diagnostic_200_E_N_mean"],
-                             "guard_E_all": per_seed[arm][s]["guard_E_all"],
-                             "guard_effrank": per_seed[arm][s]["guard_effrank"]}
-                    for s in SEEDS}
+        "gains_G": gains, "deltas_per_pair": {str(j): d for j, d in zip(PAIR_SEEDS, deltas)},
+        "mean_delta": mean_delta, "n_positive": n_positive, "n_negative": n_negative,
+        "pair_level_bootstrap_ci_primary": {"mean": ci_mean, "ci95": [ci_lo, ci_hi]},
+        "episode_level_hierarchical_ci_secondary": per_pair_ci,
+        "need_global_regression_per_pair": need_gg_regression, "need_effrank_drop_per_pair": need_effrank_drop,
+        "global_regression_ok": global_ok, "effrank_ok": effrank_ok, "guard_ok": guard_ok,
+        "fingerprint": fingerprint,
+        "per_pair_detail": {
+            arm: {str(j): {"E_N_mean": float(np.mean(per_pair[arm][j]["E_N"])),
+                             "E_all_mean": float(np.mean(per_pair[arm][j]["E_all"])),
+                             "E_W_mean": float(np.mean(per_pair[arm][j]["E_W"])),
+                             "E_V_mean": float(np.mean(per_pair[arm][j]["E_V"])),
+                             "diagnostic_200_E_N_mean": per_pair[arm][j]["diagnostic_200_E_N_mean"],
+                             "guard_E_all": per_pair[arm][j]["guard_E_all"],
+                             "guard_effrank": per_pair[arm][j]["guard_effrank"]}
+                    for j in PAIR_SEEDS}
             for arm in ("need_curriculum", "matched_random")},
+        "random_traj_curricula_by_pair": {
+            str(j): {"segments_selected": random_curricula_by_pair[j]["attrition"]["segments_selected"],
+                       "episode_ids": random_curricula_by_pair[j]["episode_ids"]}
+            for j in PAIR_SEEDS},
         "not_claimed": ["validated bisimulation", "FSM correctness", "encoder representation expansion",
-                          "general capability improvement", "a confirmatory (vs. feasibility) result"],
+                          "general capability improvement", "a confirmatory (vs. feasibility) result",
+                          "a universal claim that the method does or does not beat random curriculum selection"],
     }
     write_atomic(METRICS_PATH, metrics)
 
-    md = [f"# Two-arm feasibility pilot", "", f"**Result: {label}**", "",
-           f"Candidate: {chosen['id']} (region={chosen['region']}, action={chosen['action']}), K={k_use}", "",
-           f"mean G(need_curriculum) = {mean_G_need:.4f}  |  mean G(matched_random) = {mean_G_random:.4f}  |  "
-           f"mean delta_G = {mean_delta_G:.4f}", "",
-           f"Paired advantage (random - need), hierarchical seed-then-episode bootstrap "
-           f"(n_seeds={len(SEEDS)}, coarse): mean={ci_mean:.4f}, 95% CI=[{ci_lo:.4f}, {ci_hi:.4f}]",
-           "", f"Per-seed paired advantage: {per_seed_ci}", "",
-           "", f"Seed signs (need beats random): {seed_signs}", "",
-           f"Global-latent regression per seed: {need_gg_regression} (ok={global_ok}); "
-           f"effective-rank drop per seed: {need_effrank_drop} (ok={effrank_ok})", "",
+    md = [f"# Two-arm feasibility pilot (v2)", "", f"**Result: {label}**", "",
+           f"Candidate: {chosen['id']} (region={chosen['region']}, action={chosen['action']}), K={k_use}, "
+           f"N_PAIRS={N_PAIRS}", "",
+           f"Per-pair Delta_j (need gain - random gain): {deltas}", "",
+           f"mean Delta = {mean_delta:.4f}  |  positive pairs = {n_positive}/{N_PAIRS}  |  "
+           f"negative pairs = {n_negative}/{N_PAIRS}", "",
+           f"Primary pair-level bootstrap CI (N_PAIRS={N_PAIRS}, coarse): "
+           f"mean={ci_mean:.4f}, 95% CI=[{ci_lo:.4f}, {ci_hi:.4f}]", "",
+           f"Secondary episode-level per-pair CIs: {per_pair_ci}", "",
+           f"Global-latent regression per pair: {need_gg_regression} (ok={global_ok}); "
+           f"effective-rank drop per pair: {need_effrank_drop} (ok={effrank_ok})", "",
            "## Not claimed", ""] + [f"- {x}" for x in metrics["not_claimed"]]
     REPORT_PATH.write_text("\n".join(md))
     copy_to_downloads(METRICS_PATH, REPORT_PATH, MANIFEST_PATH)
-    print(f"\n=== PILOT FINAL: {label} ({wall.elapsed_hours():.2f}h) ===", flush=True)
+    print(f"\n=== PILOT v2 FINAL: {label} ({wall.elapsed_hours():.2f}h) ===", flush=True)
     return 0
 
 
