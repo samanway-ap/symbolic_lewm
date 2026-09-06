@@ -51,33 +51,41 @@ def unfreeze_trainable(model) -> list[torch.nn.Parameter]:
 
 def run_arm(model, theta0_state: dict, dataset, n_updates: int, seed: int,
               ckpt_path: Path | None = None, oom_retry: bool = True) -> dict:
-    model.load_state_dict(theta0_state)   # reset to the frozen node-start checkpoint
-    model.train()
-    freeze_encoder(model)
-    params = unfreeze_trainable(model)
-
-    opt = torch.optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
-    gen = torch.Generator().manual_seed(seed)
-
+    """Bug fix, code audit 2026-09-06 (P1-9): OOM/NaN used to be handled
+    IN-PLACE mid-run -- reloading `theta0_state` on NaN but leaving the
+    optimizer (Adam moment estimates), the RNG generator, and the `step`
+    counter untouched, and halving `batch_size` on OOM without restarting
+    the epoch/permutation it happened inside. Either path produced a run
+    whose trajectory depends on exactly where in the schedule the fault
+    landed -- not a clean, reproducible restart from theta0. Both faults now
+    trigger one WHOLE-RUN retry from a completely fresh attempt (model
+    reloaded to theta0, fresh optimizer, fresh RNG, step reset to 0; OOM's
+    retry additionally halves `batch_size`), matching the "one whole-run
+    retry, unchanged parameters" convention used elsewhere in this repo."""
     n = len(dataset.samples)
-    batch_size = BATCH_SIZE
     encoder_state_before = copy.deepcopy({k: v for k, v in model.state_dict().items() if k.startswith("encoder.")})
 
-    step = 0
-    loss_history = []
-    t0 = time.time()
-    retried_once = False
-    while step < n_updates:
-        n_batches = max(1, n // batch_size)
-        perm = torch.randperm(n, generator=gen).tolist()
-        for b in range(n_batches):
-            if step >= n_updates:
-                break
-            idx = perm[b * batch_size:(b + 1) * batch_size]
-            if not idx:
-                continue
-            batch_samples = [dataset.samples[i] for i in idx]
-            try:
+    def _attempt(batch_size: int) -> dict:
+        model.load_state_dict(theta0_state)   # reset to the frozen node-start checkpoint
+        model.train()
+        freeze_encoder(model)
+        params = unfreeze_trainable(model)
+        opt = torch.optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
+        gen = torch.Generator().manual_seed(seed)
+
+        step = 0
+        loss_history = []
+        t0 = time.time()
+        while step < n_updates:
+            n_batches = max(1, n // batch_size)
+            perm = torch.randperm(n, generator=gen).tolist()
+            for b in range(n_batches):
+                if step >= n_updates:
+                    break
+                idx = perm[b * batch_size:(b + 1) * batch_size]
+                if not idx:
+                    continue
+                batch_samples = [dataset.samples[i] for i in idx]
                 batch = _collate(batch_samples, dataset.pipeline, DEVICE)
                 batch["action"] = torch.nan_to_num(batch["action"], 0.0)
 
@@ -95,34 +103,31 @@ def run_arm(model, theta0_state: dict, dataset, n_updates: int, seed: int,
                 loss.backward()
                 opt.step()
                 loss_history.append(float(loss.item()))
-            except torch.cuda.OutOfMemoryError:
-                if not oom_retry:
-                    raise
-                torch.cuda.empty_cache()
-                batch_size = max(4, batch_size // 2)
-                print(f"    [OOM] halving batch size to {batch_size}, retrying", flush=True)
-                oom_retry = False
-                continue
-            except FloatingPointError:
-                if retried_once:
-                    raise
-                print("    [NaN] restoring node-start checkpoint, retrying once", flush=True)
-                model.load_state_dict(theta0_state)
-                freeze_encoder(model)
-                retried_once = True
-                continue
-            step += 1
+                step += 1
 
-    encoder_state_after = {k: v for k, v in model.state_dict().items() if k.startswith("encoder.")}
-    for k in encoder_state_before:
-        if not torch.equal(encoder_state_before[k], encoder_state_after[k]):
-            raise RuntimeError(f"IMPLEMENTATION_FAILURE: encoder tensor {k} changed despite freeze")
+        encoder_state_after = {k: v for k, v in model.state_dict().items() if k.startswith("encoder.")}
+        for k in encoder_state_before:
+            if not torch.equal(encoder_state_before[k], encoder_state_after[k]):
+                raise RuntimeError(f"IMPLEMENTATION_FAILURE: encoder tensor {k} changed despite freeze")
 
-    if ckpt_path is not None:
-        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), ckpt_path)
+        if ckpt_path is not None:
+            ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), ckpt_path)
 
-    return {"n_steps": step, "n_samples": n, "batch_size": batch_size,
-              "final_loss": loss_history[-1] if loss_history else None,
-              "mean_loss_last10": float(np.mean(loss_history[-10:])) if loss_history else None,
-              "wall_time_s": time.time() - t0, "checkpoint": str(ckpt_path) if ckpt_path else None}
+        return {"n_steps": step, "n_samples": n, "batch_size": batch_size,
+                  "final_loss": loss_history[-1] if loss_history else None,
+                  "mean_loss_last10": float(np.mean(loss_history[-10:])) if loss_history else None,
+                  "wall_time_s": time.time() - t0, "checkpoint": str(ckpt_path) if ckpt_path else None}
+
+    try:
+        return _attempt(BATCH_SIZE)
+    except torch.cuda.OutOfMemoryError:
+        if not oom_retry:
+            raise
+        torch.cuda.empty_cache()
+        retry_batch_size = max(4, BATCH_SIZE // 2)
+        print(f"    [OOM] whole-run retry with halved batch size {retry_batch_size}", flush=True)
+        return _attempt(retry_batch_size)
+    except FloatingPointError as e:
+        print(f"    [NaN] {e}: whole-run retry, unchanged parameters", flush=True)
+        return _attempt(BATCH_SIZE)

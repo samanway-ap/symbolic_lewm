@@ -24,7 +24,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from autopilot.geometry import local_tangent, score_grad_bank  # noqa: E402
+from autopilot.common import stable_seed  # noqa: E402
+from autopilot.geometry import intersect_tangent_with_Vperp, local_tangent, score_grad_bank  # noqa: E402
 from autopilot.need_common import AlphabetLookup, project_residualized  # noqa: E402
 from oracle.droid_actions import load_actions_for_episodes  # noqa: E402
 from oracle.droid_streaming import stream_many_windows  # noqa: E402
@@ -194,35 +195,41 @@ def build_cell_gradient_basis(records_for_cell: list[dict], model, pipeline, U_m
 
 
 def project_T_into_Vperp(T_basis: np.ndarray, V_basis: np.ndarray, tol: float = 1e-6) -> np.ndarray:
-    d = T_basis.shape[1]
-    if V_basis.shape[0] == 0:
-        W_basis = T_basis
-    else:
-        proj = T_basis - (T_basis @ V_basis.T) @ V_basis
-        norms = np.linalg.norm(proj, axis=1)
-        keep = norms > tol
-        if keep.sum() == 0:
-            return np.zeros((0, d))
-        Q, _ = np.linalg.qr(proj[keep].T)
-        W_basis = Q.T[: keep.sum()]
-    return W_basis
+    """Name kept for call-site compatibility; computes the actual
+    intersection T \\cap V^perp now (see `intersect_tangent_with_Vperp`'s
+    docstring for the bug this replaced -- the old body here projected T's
+    rows into V^perp and orthonormalized the projected IMAGE, which is a
+    different, generally larger subspace than the true intersection)."""
+    return intersect_tangent_with_Vperp(T_basis, V_basis, rtol=tol)
 
 
 def build_need_basis(records_for_cell: list[dict], W_basis: np.ndarray) -> dict:
     """SS3.3: error-weighted N(r,a,1) via thin SVD of B_W^T e_j -- no d x d
-    covariance ever formed."""
+    covariance ever formed.
+
+    Uses the UNCENTERED second moment E[ee^T] of the projected residuals,
+    not the centered covariance (bug fix, code audit 2026-09-06): if the
+    frozen model consistently under/over-predicts along some direction, that
+    MEAN residual is exactly the systematic, learnable error the need space
+    is supposed to find -- the previous `X - X.mean(...)` centering step
+    deleted it before the SVD ever saw it, keeping only directions of
+    residual VARIANCE around that (removed) mean. `mean_bias_energy` is
+    reported separately as a diagnostic: the fraction of total residual
+    energy that was concentrated in the mean (large values mean the fix
+    changes B_N a lot relative to the old centered version)."""
     d = W_basis.shape[1] if W_basis.ndim == 2 else 0
     if W_basis.shape[0] == 0 or not records_for_cell:
-        return {"B_N": np.zeros((0, d)), "q": 0, "eta_c": 0.0, "energy_zero": True}
+        return {"B_N": np.zeros((0, d)), "q": 0, "eta_c": 0.0, "energy_zero": True, "mean_bias_energy_frac": 0.0}
 
     E = np.stack([r["residual"] for r in records_for_cell])           # (n, D)
     Znext = np.stack([r["z_next"] for r in records_for_cell])          # (n, D)
     X = E @ W_basis.T                                                    # (n, dim_W)
-    Xc = X - X.mean(axis=0, keepdims=True)
-    if Xc.shape[0] < 2 or not np.any(np.abs(Xc) > 1e-12):
-        return {"B_N": np.zeros((0, d)), "q": 0, "eta_c": 0.0, "energy_zero": True}
+    if X.shape[0] < 2 or not np.any(np.abs(X) > 1e-12):
+        return {"B_N": np.zeros((0, d)), "q": 0, "eta_c": 0.0, "energy_zero": True, "mean_bias_energy_frac": 0.0}
 
-    _, s, Rt = np.linalg.svd(Xc, full_matrices=False)
+    mean_bias_energy_frac = float((X.mean(axis=0) ** 2).sum() / max((X ** 2).sum() / X.shape[0], 1e-12))
+
+    _, s, Rt = np.linalg.svd(X, full_matrices=False)
     cum = np.cumsum(s ** 2) / max((s ** 2).sum(), 1e-12)
     q = int(np.searchsorted(cum, NEED_ENERGY) + 1)
     q = int(np.clip(q, NEED_RANK_MIN, min(NEED_RANK_MAX, W_basis.shape[0])))
@@ -230,8 +237,9 @@ def build_need_basis(records_for_cell: list[dict], W_basis: np.ndarray) -> dict:
 
     zw = Znext @ W_basis.T
     tr_cov_w = float(np.trace(np.cov(zw.T))) if zw.shape[0] > 1 else 1.0
-    eta_c = float((Xc ** 2).sum() / Xc.shape[0] / max(tr_cov_w, 1e-12))
-    return {"B_N": B_N, "q": q, "eta_c": eta_c, "energy_zero": False}
+    eta_c = float((X ** 2).sum() / X.shape[0] / max(tr_cov_w, 1e-12))
+    return {"B_N": B_N, "q": q, "eta_c": eta_c, "energy_zero": False,
+              "mean_bias_energy_frac": mean_bias_energy_frac}
 
 
 def random_subspace_inside(container_basis: np.ndarray, dim: int, seed: int) -> np.ndarray:
@@ -280,7 +288,7 @@ def build_global_W_control(region_id: int, sibling_action_records: dict[str, lis
     T_basis, _, _ = local_tangent(anchor_z, real_latents_pool, k_local, TANGENT_ENERGY)
     V_rows = []
     for a_letter, recs in sibling_action_records.items():
-        grad = build_cell_gradient_basis(recs, model, pipeline, U_m, seed + hash(a_letter) % 10000)
+        grad = build_cell_gradient_basis(recs, model, pipeline, U_m, stable_seed(seed, a_letter))
         if grad["V_basis"].shape[0] > 0:
             V_rows.append(grad["V_basis"])
 

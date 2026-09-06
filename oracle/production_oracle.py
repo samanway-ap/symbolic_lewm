@@ -23,7 +23,7 @@ from oracle.droid_streaming import stream_episode_frames
 from oracle.latent_oracle import LatentOracle
 from oracle.lewm_g import (
     ActionPipeline, FRAMESKIP, HISTORY_SIZE, RAW_ACTION_DIM, EMBED_DIM,
-    LeWMWindowState, encode_initial_window, get_model,
+    LeWMWindowState, advance, encode_initial_window, get_model,
 )
 
 OUT_DIR = Path(__file__).resolve().parents[1] / "artifacts"
@@ -50,9 +50,7 @@ def _step_fn_from_convention(pipeline: ActionPipeline):
                 normed = pipeline.normalizer(chunk).reshape(1, -1)
                 a = torch.from_numpy(normed).float().unsqueeze(0).to(device)
                 new_act_emb = model.action_encoder(a)[:, 0]
-                pred = model.predict(emb, act_emb)[:, -1:]
-                emb = torch.cat([emb[:, 1:], pred], dim=1)
-                act_emb = torch.cat([act_emb[:, 1:], new_act_emb.unsqueeze(1)], dim=1)
+                emb, act_emb, _pred = advance(model, emb, act_emb, new_act_emb)
         return LeWMWindowState(emb=emb[0].cpu(), act_emb=act_emb[0].cpu())
 
     return step_fn

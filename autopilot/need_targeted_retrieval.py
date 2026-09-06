@@ -57,6 +57,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from autopilot.common import stable_seed  # noqa: E402
 from autopilot.need_geometry import N_POSITIONS, assign_region, random_subspace_inside  # noqa: E402
 from oracle.droid_actions import load_actions_for_episodes  # noqa: E402
 from oracle.droid_streaming import stream_requests_hardened  # noqa: E402
@@ -201,7 +202,7 @@ def run_targeted_retrieval(candidates: list[dict], pool_episode_ids: list[int], 
         geom, gg = cand["geometry"], cand["global_geometry"]
         d_amb = geom["B_N"].shape[1]
         W_all = gg["W_all_basis"] if gg and not gg.get("empty") else np.zeros((0, d_amb))
-        rand_seed = seed + (hash(cell) % 1_000_000) + 7
+        rand_seed = stable_seed(seed, cell, "rand_basis")
         rand_basis = random_subspace_inside(geom["W_basis"], geom["dim_N"], seed=rand_seed)
         state[cell] = {
             "W_all": W_all, "rand_basis": rand_basis,
@@ -251,8 +252,18 @@ def run_targeted_retrieval(candidates: list[dict], pool_episode_ids: list[int], 
                 st = state[cell]
                 st["n_common_eligible"] += 1
                 delta = z_next - z0
-                record = {"eid": eid, "t": t, "delta": delta, "delta_norm": float(np.linalg.norm(delta)),
-                          "residual": z_pred - z_next}
+                # Preserve the EXACT decoded window this occurrence was scored from (bug fix,
+                # code audit 2026-09-06, P0-1): downstream curriculum construction used to keep
+                # only `eid`, discarding `t` -- dataset construction then reloaded a DIFFERENT,
+                # randomly-windowed slice of the episode's first 20 positions, so the model never
+                # actually trained on the segment retrieval selected. Storing the pixels/raw_action
+                # already decoded here means the training dataset builder needs no second decode
+                # pass and is structurally unable to substitute a different position.
+                record = {"eid": eid, "t": t, "region": region, "letter": letter,
+                          "delta": delta, "delta_norm": float(np.linalg.norm(delta)),
+                          "residual": z_pred - z_next,
+                          "pixels": decoded[(eid, t, letter)].copy(),
+                          "raw_action": raw_full[t - HISTORY_SIZE + 1:t + 2].copy()}
                 _heap_push_bounded(st["heap_cond"], _rho(record, cand_by_cell[cell]["geometry"]["B_N"]), record, heap_cap)
                 _heap_push_bounded(st["heap_gw"], _rho(record, st["W_all"]), record, heap_cap)
                 _heap_push_bounded(st["heap_rand"], _rho(record, st["rand_basis"]), record, heap_cap)
@@ -277,6 +288,15 @@ def run_targeted_retrieval(candidates: list[dict], pool_episode_ids: list[int], 
             continue
         k_use = k_target if n_common >= k_target_threshold else k_fallback
 
+        def _segments(chosen: list) -> list:
+            # The atomic, authoritative unit each arm's dataset is built from
+            # (bug fix P0-1): eid/t identify the EXACT selected transition;
+            # pixels/raw_action are the SAME decoded window scored above --
+            # `episode_ids` is retained alongside only for logging/novelty
+            # bookkeeping, never as the thing training actually consumes.
+            return [{"eid": rec["eid"], "t": rec["t"], "pixels": rec["pixels"], "raw_action": rec["raw_action"]}
+                    for rec in chosen]
+
         curricula = {}
         for arm, heap in (("conditional_need", st["heap_cond"]), ("global_W", st["heap_gw"]),
                             ("random_dir", st["heap_rand"])):
@@ -285,7 +305,7 @@ def run_targeted_retrieval(candidates: list[dict], pool_episode_ids: list[int], 
             ratio_used = PROJECTION_RATIO_ORDER[0] if n50 >= k_use else PROJECTION_RATIO_ORDER[1]
             chosen = [rec for r, _, rec in items_sorted if r >= ratio_used][:k_use]
             episode_ids = sorted(set(rec["eid"] for rec in chosen))
-            curricula[arm] = {"episode_ids": episode_ids,
+            curricula[arm] = {"episode_ids": episode_ids, "segments": _segments(chosen),
                                 "attrition": {"segments_selected": len(chosen), "ratio_used": ratio_used,
                                                 "episodes_selected": len(episode_ids),
                                                 "common_eligible_segments": n_common}}
@@ -293,14 +313,14 @@ def run_targeted_retrieval(candidates: list[dict], pool_episode_ids: list[int], 
         items_sorted = sorted(st["heap_err"], key=lambda x: -x[0])[:k_use]
         chosen = [rec for _, _, rec in items_sorted]
         episode_ids = sorted(set(rec["eid"] for rec in chosen))
-        curricula["error_only"] = {"episode_ids": episode_ids,
+        curricula["error_only"] = {"episode_ids": episode_ids, "segments": _segments(chosen),
                                       "attrition": {"segments_selected": len(chosen),
                                                       "episodes_selected": len(episode_ids),
                                                       "common_eligible_segments": n_common}}
 
         chosen = st["reservoir_traj"][:k_use]
         episode_ids = sorted(set(rec["eid"] for rec in chosen))
-        curricula["random_traj"] = {"episode_ids": episode_ids,
+        curricula["random_traj"] = {"episode_ids": episode_ids, "segments": _segments(chosen),
                                        "attrition": {"segments_selected": len(chosen),
                                                        "episodes_selected": len(episode_ids),
                                                        "common_eligible_segments": n_common}}

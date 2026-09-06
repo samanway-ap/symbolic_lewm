@@ -61,6 +61,25 @@ def build_dataset_from_episodes(episode_ids: list[int], pipeline: "ActionPipelin
     return ArmDataset(samples=samples, pipeline=pipeline, episode_ids=ok)
 
 
+def build_dataset_from_segments(segments: list[dict], pipeline: "ActionPipeline") -> ArmDataset:
+    """Builds a dataset from EXACT selected segments (bug fix, code audit
+    2026-09-06, P0-1): `autopilot/need_targeted_retrieval.py`'s retrieval
+    curricula used to be collapsed to a bare episode-id list, and
+    `build_dataset_from_episodes` would then reload only the first
+    `N_POSITIONS` positions of each episode and sample RANDOM windows within
+    them -- with no guarantee of any overlap with the actual selected
+    `(episode_id, t)` transition, action, region, or alignment score that
+    retrieval scored and ranked. Each `segment` here already carries the
+    EXACT decoded `pixels`/`raw_action` window `need_targeted_retrieval.py`
+    scored (no second decode, and structurally unable to substitute a
+    different position) -- one training sample per segment, not up to eight
+    random ones per episode."""
+    samples = [{"pixels": np.asarray(seg["pixels"]), "raw_action": np.asarray(seg["raw_action"]),
+                "episode": int(seg["eid"]), "pos": int(seg["t"])} for seg in segments]
+    episode_ids = sorted(set(s["episode"] for s in samples))
+    return ArmDataset(samples=samples, pipeline=pipeline, episode_ids=episode_ids)
+
+
 def build_replay_dataset(replay_train_ids: list[int], target_n_samples: int, pipeline: "ActionPipeline",
                              seed: int = 3072) -> ArmDataset:
     """`continue` arm: sample enough replay_train episodes to reach roughly

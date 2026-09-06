@@ -47,6 +47,35 @@ def score_grad_bank(model, state0, real_letters_converted: list[np.ndarray], pip
     return rows
 
 
+def intersect_tangent_with_Vperp(T_basis: np.ndarray, V_basis: np.ndarray, rtol: float = 1e-6,
+                                     atol: float = 1e-10) -> np.ndarray:
+    """The actual W = T \\cap V^perp, replacing a confirmed bug (code audit,
+    2026-09-06): the previous implementation computed and orthonormalized
+    P_{V^perp}(T) -- the projection of T's basis rows into V^perp -- which
+    is a DIFFERENT subspace from the true intersection. A 2D counterexample:
+    T=span(e1), V=span((e1+e2)/sqrt2) has intersection {0}, but
+    P_{V^perp}(T) is nonzero (it manufactures a spurious "blind" direction
+    that is orthogonal to V but not actually inside T).
+
+    A vector w = c^T @ T_basis (c a coefficient vector in T's own coordinate
+    space) is orthogonal to every row of V_basis iff V_basis @ w^T = 0, i.e.
+    C @ c = 0 where C = V_basis @ T_basis.T. So W is exactly T_basis's
+    coordinate-space representation of null(C), mapped back through
+    T_basis. Since T_basis has orthonormal rows, this mapping preserves
+    orthonormality -- the result needs no further QR/orthonormalization."""
+    d = T_basis.shape[1]
+    if V_basis.shape[0] == 0 or T_basis.shape[0] == 0:
+        return T_basis
+    C = V_basis @ T_basis.T                                   # (v, t)
+    _, s, Vh = np.linalg.svd(C, full_matrices=True)            # Vh: (t, t)
+    tol = atol + rtol * (s[0] if s.size else 0.0)
+    rank = int(np.sum(s > tol))
+    if rank >= T_basis.shape[0]:
+        return np.zeros((0, d))
+    W_basis = Vh[rank:] @ T_basis                                # null(C) mapped back to ambient space
+    return W_basis
+
+
 def local_tangent(base_z: np.ndarray, real_latents: np.ndarray, k: int = 256, energy: float = PCA_ENERGY):
     d2 = ((real_latents - base_z[None, :]) ** 2).sum(axis=1)
     idx = np.argpartition(d2, min(k, len(d2) - 1))[:k]
@@ -82,17 +111,7 @@ def compute_T_V_W(model, state0, base_z: np.ndarray, real_words_converted: list[
 
     T_basis, neigh, neigh_idx = local_tangent(base_z, real_latents_pool, k_local, energy)
 
-    if V_basis.shape[0] == 0:
-        W_basis = T_basis
-    else:
-        proj = T_basis - (T_basis @ V_basis.T) @ V_basis
-        norms = np.linalg.norm(proj, axis=1)
-        keep = norms > tol
-        if keep.sum() == 0:
-            W_basis = np.zeros((0, d))
-        else:
-            Q, _ = np.linalg.qr(proj[keep].T)
-            W_basis = Q.T[: keep.sum()]
+    W_basis = intersect_tangent_with_Vperp(T_basis, V_basis, rtol=tol)
 
     return {"dim_T": int(T_basis.shape[0]), "dim_V": int(V_basis.shape[0]), "dim_W": int(W_basis.shape[0]),
               "W_ratio": float(W_basis.shape[0] / max(1, T_basis.shape[0])),

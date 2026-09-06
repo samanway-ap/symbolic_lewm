@@ -43,6 +43,21 @@ def short_hash(obj) -> str:
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
+def stable_seed(base: int, *parts: object) -> int:
+    """Deterministic seed derivation, replacing `hash(x) % N` (bug fix, code
+    audit 2026-09-06): Python intentionally salts `str`/`tuple` hashing
+    per-PROCESS unless `PYTHONHASHSEED` is fixed before interpreter startup,
+    so `base + hash(some_str_or_tuple) % N` -- used throughout this package
+    to derive per-cell/per-arm/per-candidate seeds -- silently produced a
+    DIFFERENT seed on every fresh process, breaking cross-run
+    reproducibility of anything downstream (which candidate's random_dir
+    basis, which reservoir sample, etc.). SHA-256 over a JSON-serialized,
+    sorted representation of `(base, *parts)` is stable across processes,
+    interpreters, and machines."""
+    blob = json.dumps([base, *parts], sort_keys=True, default=str).encode()
+    return int.from_bytes(hashlib.sha256(blob).digest()[:8], "big") % (2 ** 32)
+
+
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 

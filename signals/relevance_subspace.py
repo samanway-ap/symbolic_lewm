@@ -35,7 +35,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from oracle.lewm_g import DEVICE, EMBED_DIM, HISTORY_SIZE, encode_initial_window, get_model
+from oracle.lewm_g import DEVICE, EMBED_DIM, HISTORY_SIZE, advance, encode_initial_window, get_model
 from oracle.production_oracle import load_alphabet_symbols
 
 OUT_DIR = Path(__file__).resolve().parents[1] / "artifacts"
@@ -111,13 +111,19 @@ def differentiable_step(model, emb, act_emb, raw_segment_converted: np.ndarray, 
     wraps this in torch.no_grad() for inference). `raw_segment_converted`
     is a (FRAMESKIP,7) array already in droid_100 convention (alphabet
     medoids are stored that way) -- only the z-score normalizer stage
-    applies, matching the production oracle's own convention handling."""
+    applies, matching the production oracle's own convention handling.
+    Uses the shared `advance()` (correct action-timing order: the new
+    action is appended to `act_emb` BEFORE `predict` is called) -- see its
+    docstring. For the single-letter (h=1) callers in this codebase the
+    prior append-after-predict bug was benign (the passed-in `act_emb`'s
+    last slot already held the real current action from the caller's own
+    window construction), but for multi-letter suffixes (`len(suffix) > 1`
+    in `compute_relevance_subspace`) each step after the first used a
+    stale action, so this fix changes results for suffix length > 1."""
     normed = pipeline.normalizer(raw_segment_converted).reshape(1, -1)
     a = torch.from_numpy(normed).float().unsqueeze(0).to(emb.device)
     new_act_emb = model.action_encoder(a)[:, 0]
-    pred = model.predict(emb, act_emb)[:, -1:]
-    emb = torch.cat([emb[:, 1:], pred], dim=1)
-    act_emb = torch.cat([act_emb[:, 1:], new_act_emb.unsqueeze(1)], dim=1)
+    emb, act_emb, _pred = advance(model, emb, act_emb, new_act_emb)
     return emb, act_emb
 
 

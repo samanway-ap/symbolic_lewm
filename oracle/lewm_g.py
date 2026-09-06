@@ -41,7 +41,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-_LEWM_DIR = r"C:\Users\Admin\Projects\le-wm"
+# Bug fix, code audit 2026-09-06 (P2-1): was a hardcoded machine-specific
+# absolute path, unusable on any other checkout. Configurable via the
+# LEWM_DIR env var (falls back to a `le-wm` checkout next to this repo).
+_LEWM_DIR = os.environ.get("LEWM_DIR", str(Path(__file__).resolve().parents[2] / "le-wm"))
 if _LEWM_DIR not in sys.path:
     sys.path.insert(0, _LEWM_DIR)
 os.environ.setdefault("STABLEWM_HOME", str(Path(_LEWM_DIR) / ".stable-wm"))
@@ -168,6 +171,36 @@ class ActionPipeline:
         return self.normalizer(self.converter(raw))
 
 
+def advance(model, emb: torch.Tensor, act_emb: torch.Tensor, action_embedding: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The ONE correct model step, centralizing action-timing alignment.
+
+    Bug this replaces (confirmed by code audit, 2026-09-06 -- see
+    SYMBOLIC_LEWM_CODE_AND_METHOD_AUDIT.md): every rollout helper in this
+    codebase called `model.predict(emb, act_emb)` BEFORE appending the new
+    action's embedding to `act_emb`, then appended it afterward. Training
+    pairs `ctx_act[:, j]` with the prediction of `emb[:, j+1]` (see
+    `train_arm.py`/`finetune.py`), so `act_emb[:, -1]` must already be the
+    action driving the CURRENT last state to the next one at the moment
+    `predict` is called -- appending after the call means predict always
+    used the PREVIOUS iteration's action, delaying every action's effect by
+    one step (the first supplied action never affects the first predicted
+    state at all). This does not corrupt direct one-step teacher-forced
+    training/eval (the real window already has the correct action in the
+    last slot before any rollout call happens), but it does corrupt every
+    multi-step autoregressive rollout and any FSM/oracle built on one.
+
+    `action_embedding` is the ALREADY-ENCODED (via `model.action_encoder`)
+    embedding for the new action, shape (B, D) or (D,). Returns the
+    shifted (emb, act_emb) AND the newly predicted next-state, so callers
+    that want the prediction don't have to re-slice `emb[:, -1]`."""
+    if action_embedding.dim() == 1:
+        action_embedding = action_embedding.unsqueeze(0)
+    act_emb = torch.cat([act_emb[:, 1:], action_embedding.unsqueeze(1)], dim=1)   # append BEFORE predict
+    pred = model.predict(emb, act_emb)[:, -1:]
+    emb = torch.cat([emb[:, 1:], pred], dim=1)
+    return emb, act_emb, pred
+
+
 def encode_initial_window(
     pixel_frames: np.ndarray,        # (HISTORY_SIZE, H, W, 3) uint8, subsampled by FRAMESKIP
     raw_actions: np.ndarray,         # (HISTORY_SIZE, FRAMESKIP, RAW_ACTION_DIM) float, per-position action pairs
@@ -245,10 +278,8 @@ def rollout_batch(
             norm = pipeline(chunk.reshape(-1, RAW_ACTION_DIM)).reshape(B, FRAMESKIP * RAW_ACTION_DIM)
             a = torch.from_numpy(norm).float().unsqueeze(1).to(DEVICE)  # (B,1,14)
             new_act_emb = model.action_encoder(a)[:, 0]                  # (B,D)
-            pred = model.predict(emb, act_emb)[:, -1]                     # (B,D)
-            trace.append(pred.cpu())
-            emb = torch.cat([emb[:, 1:], pred.unsqueeze(1)], dim=1)
-            act_emb = torch.cat([act_emb[:, 1:], new_act_emb.unsqueeze(1)], dim=1)
+            emb, act_emb, pred = advance(model, emb, act_emb, new_act_emb)
+            trace.append(pred[:, 0].cpu())
     return torch.stack(trace, dim=1)  # (B, n_steps, D)
 
 
@@ -298,10 +329,8 @@ def rollout_batch_from_convention(
             normed = pipeline.normalizer(chunk.reshape(-1, RAW_ACTION_DIM)).reshape(B, FRAMESKIP * RAW_ACTION_DIM)
             a = torch.from_numpy(normed).float().unsqueeze(1).to(DEVICE)
             new_act_emb = model.action_encoder(a)[:, 0]
-            pred = model.predict(emb, act_emb)[:, -1]
-            trace.append(pred.cpu())
-            emb = torch.cat([emb[:, 1:], pred.unsqueeze(1)], dim=1)
-            act_emb = torch.cat([act_emb[:, 1:], new_act_emb.unsqueeze(1)], dim=1)
+            emb, act_emb, pred = advance(model, emb, act_emb, new_act_emb)
+            trace.append(pred[:, 0].cpu())
     return torch.stack(trace, dim=1)  # (B, n_steps, D)
 
 
@@ -326,10 +355,7 @@ def step_fn_factory(pipeline: "ActionPipeline"):
                 chunk = pipeline(chunk_raw).reshape(1, -1)                          # (1,14)
                 a = torch.from_numpy(chunk).float().unsqueeze(0).to(DEVICE)  # (1,1,14)
                 new_act_emb = model.action_encoder(a)[:, 0]                   # (1,D)
-
-                pred = model.predict(emb, act_emb)[:, -1:]                    # (1,1,D)
-                emb = torch.cat([emb[:, 1:], pred], dim=1)
-                act_emb = torch.cat([act_emb[:, 1:], new_act_emb.unsqueeze(1)], dim=1)
+                emb, act_emb, _pred = advance(model, emb, act_emb, new_act_emb)
 
         return LeWMWindowState(emb=emb[0].cpu(), act_emb=act_emb[0].cpu())
 

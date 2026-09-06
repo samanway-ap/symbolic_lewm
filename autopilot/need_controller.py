@@ -28,11 +28,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from autopilot.common import (  # noqa: E402
     AP_DIR, OUT_DIR, SEED, assert_disjoint_splits, build_splits, copy_to_downloads,
-    load_frozen_directions, load_partial_model, now_iso, write_atomic,
+    load_frozen_directions, load_partial_model, now_iso, stable_seed, write_atomic,
 )
 from autopilot.controller import build_real_latents_pool, fit_pipeline  # noqa: E402
-from autopilot.dataset import build_dataset_from_episodes, build_replay_dataset  # noqa: E402
-from autopilot.evaluate import evaluate_E_W, paired_bootstrap_ci  # noqa: E402
+from autopilot.dataset import ArmDataset, build_dataset_from_segments, build_replay_dataset  # noqa: E402
+from autopilot.evaluate import assert_slice_nonempty, evaluate_E_W, paired_bootstrap_ci  # noqa: E402
 from autopilot.need_common import (  # noqa: E402
     ALPHABET_PATH, CANDIDATES_PATH, FINAL_JSON, FINAL_MD, NEED_AP_DIR, REGIONS_PATH, STATE_PATH,
     TARGETED_RETRIEVAL_CACHE_PATH,
@@ -180,7 +180,7 @@ def build_regions_and_cells(manifest: dict, lever0_basis: dict, model, pipeline,
         frozen = []
         for r, a in target_cells:
             geom = build_cell_geometry(by_cell[(r, a)], anchors[r], real_latents_by_region[r],
-                                          model, pipeline, U4, seed=SEED + hash((r, a)) % 100000)
+                                          model, pipeline, U4, seed=stable_seed(SEED, r, a))
             if geom is None:
                 raise RuntimeError(f"FATAL_SPEC_AMBIGUITY: target cell (r={r}, a={a}) produced invalid "
                                       f"geometry on reconstruction")
@@ -211,7 +211,7 @@ def build_regions_and_cells(manifest: dict, lever0_basis: dict, model, pipeline,
         valid_cells = []
         for r, a, energy in prescreened:
             geom = build_cell_geometry(by_cell[(r, a)], anchors[r], real_latents_by_region[r],
-                                          model, pipeline, U4, seed=SEED + hash((r, a)) % 100000)
+                                          model, pipeline, U4, seed=stable_seed(SEED, r, a))
             if geom is None:
                 print(f"    cell (r={r}, a={a}): INVALID, discarded", flush=True)
                 continue
@@ -331,10 +331,15 @@ def build_node_datasets(cand: dict, manifest: dict, pipeline, curricula: dict | 
         print(f"    [{cand['id']}] retrieval[{cand['region']}/{cand['action']}] arm={arm}: "
               f"{c['attrition']}", flush=True)
 
-    n_target_samples = max(1, len(curricula["conditional_need"]["episode_ids"])) * 8
+    n_target_samples = max(1, len(curricula["conditional_need"]["segments"])) * 8
     replay_ds = build_replay_dataset(manifest["episode_ids"]["replay_train"], n_target_samples, pipeline, seed=SEED)
 
-    arm_datasets = {arm: build_dataset_from_episodes(curricula[arm]["episode_ids"], pipeline, seed=SEED)
+    # Bug fix, code audit 2026-09-06 (P0-1): built from EPISODE IDS, which
+    # `build_dataset_from_episodes` then re-windows into RANDOM (episode,
+    # position) pairs -- discarding the exact selected (episode_id, t)
+    # segments retrieval scored and ranked, with no guaranteed overlap.
+    # `build_dataset_from_segments` trains on the exact retrieved segments.
+    arm_datasets = {arm: build_dataset_from_segments(curricula[arm]["segments"], pipeline)
                        for arm in ("conditional_need", "global_W", "error_only", "random_dir", "random_traj")}
     arm_datasets["continue"] = replay_ds
     for arm, ds in arm_datasets.items():
@@ -397,7 +402,7 @@ def run_stage_need(cand: dict, arm_datasets: dict, model, pipeline, theta0_state
         vals_cond = np.concatenate(arm_results["conditional_need"]["E_N"])
         vals_ctrl = np.concatenate(arm_results[control]["E_N"])
         n = min(len(vals_cond), len(vals_ctrl))
-        mean_adv, lo, hi = paired_bootstrap_ci(vals_ctrl[:n], vals_cond[:n], seed=SEED + hash(control) % 10000)
+        mean_adv, lo, hi = paired_bootstrap_ci(vals_ctrl[:n], vals_cond[:n], seed=stable_seed(SEED, control))
         advantages[control] = {"mean": mean_adv, "ci95": [lo, hi]}
         per_seed_signs = []
         for i in range(len(seeds)):
@@ -461,7 +466,7 @@ def run_confirmation(cand: dict, model, pipeline, anchors, lever0_basis, alphabe
     for control in S1_CONTROLS + ["error_only"]:
         n = min(len(results["conditional_need"]), len(results[control]))
         mean_adv, lo, hi = paired_bootstrap_ci(results[control][:n], results["conditional_need"][:n],
-                                                  seed=SEED + hash(control) % 10000)
+                                                  seed=stable_seed(SEED, control))
         advantages[control] = {"mean": mean_adv, "ci95": [lo, hi]}
 
     s1_confirmed = all(advantages[c]["mean"] > 0 for c in S1_CONTROLS) and all(
@@ -473,16 +478,29 @@ def run_confirmation(cand: dict, model, pipeline, anchors, lever0_basis, alphabe
 
 
 def build_rescue_datasets(base_datasets: dict, manifest: dict, pipeline) -> dict:
-    """The one licensed 2:1 replay rescue (loop v6 SS6 / experiment v7 SS5):
-    operationalised as doubling the `continue` arm's replay sample count
-    relative to the matched curricula (all other arms' frozen episode
-    selections are UNCHANGED, so this is still a "matched six-arm" rerun --
-    only the `continue` control's own replay allocation grows). Documented
-    here since v7 does not spell out the mixing mechanics verbatim."""
+    """The one licensed 2:1 replay rescue (loop v6 SS6 / experiment v7 SS5).
+
+    Bug fix, code audit 2026-09-06 (P1-7): `run_stage_need`'s `forgetting`
+    flag is computed ONLY from the `conditional_need` arm's own post-training
+    guard regression / effective-rank drop (`cond_gg_e_all`/`cond_effrank`
+    are appended `if arm == "conditional_need"` and nothing else). The
+    previous implementation enlarged the UNRELATED `continue` control arm's
+    replay instead -- `continue` never exhibited forgetting, and nothing
+    about its own training changes when a different dict entry is replaced,
+    so the "rescue" was a no-op with respect to the condition it claimed to
+    rescue. The licensed 2:1 rescue must give `conditional_need` itself 2x
+    replay samples MIXED INTO its own curriculum (curriculum + 2*curriculum
+    replay), since that is the arm whose training is actually causing the
+    regression; `continue` and the other controls are left untouched so
+    this remains a "matched six-arm" rerun apart from that one change."""
+    curr_ds = base_datasets["conditional_need"]
+    n_curriculum_samples = len(curr_ds.samples)
+    replay_ds = build_replay_dataset(manifest["episode_ids"]["replay_train"],
+                                        max(1, n_curriculum_samples) * 2, pipeline, seed=SEED + 1)
     rescued = dict(base_datasets)
-    n_curriculum_samples = len(base_datasets["conditional_need"].samples)
-    rescued["continue"] = build_replay_dataset(manifest["episode_ids"]["replay_train"],
-                                                  max(1, n_curriculum_samples) * 2, pipeline, seed=SEED + 1)
+    rescued["conditional_need"] = ArmDataset(
+        samples=curr_ds.samples + replay_ds.samples, pipeline=pipeline,
+        episode_ids=sorted(set(curr_ds.episode_ids) | set(replay_ds.episode_ids)))
     return rescued
 
 
@@ -563,7 +581,11 @@ def main():
     alphabet = AlphabetLookup()
     model = load_partial_model()
     theta0_state = copy.deepcopy(model.state_dict())
-    pipeline = fit_pipeline(manifest["episode_ids"]["route_val"] + manifest["episode_ids"]["replay_train"])
+    # Bug fix, code audit 2026-09-06 (P0-6): fitting on route_val + replay_train
+    # leaks route_val's own action statistics into the pipeline before it is
+    # later used to build every eval_slice FROM route_val. Fit on
+    # replay_train only.
+    pipeline = fit_pipeline(manifest["episode_ids"]["replay_train"])
     confirm_state = _load_confirm_state()
     append_need_ledger({"event_type": "INIT", "timestamp": now_iso(), "attempt1_hours_charged": ATTEMPT1_HOURS_USED})
 
@@ -581,6 +603,7 @@ def main():
 
     guard_ids = manifest["episode_ids"]["global_guard"][:80]
     guard_slice = build_eval_slice(guard_ids, n_per_episode=4, seed=SEED + 1)
+    assert_slice_nonempty(guard_slice, "global guard slice", min_episodes=5)
 
     print(f"=== targeted retrieval pass (inverted action-letter index over the FULL pool, "
           f"{MAX_RETRIEVAL_MINUTES:.0f}-minute cap, deterministic hash order) ===", flush=True)
@@ -607,7 +630,7 @@ def main():
         run_log[cand["id"]] = {"region": cand["region"], "action": cand["action"]}
         node_eval_slices[cand["id"]] = build_cell_eval_slice(
             manifest["episode_ids"]["route_val"], cand["region"], cand["action"], anchors, lever0_basis,
-            pipeline, alphabet, seed=SEED + hash(cand["id"]) % 10000)
+            pipeline, alphabet, seed=stable_seed(SEED, cand["id"]))
         curricula = curricula_by_cell.get((cand["region"], cand["action"]))
         node_datasets[cand["id"]] = build_node_datasets(cand, manifest, pipeline, curricula)
         if node_datasets[cand["id"]] is None:

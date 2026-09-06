@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,6 +37,9 @@ class ExtractionResult:
     n_queries: int
     wall_time_s: float
     predicate_subset: list
+    error_type: str | None = None
+    error_message: str | None = None
+    error_traceback: str | None = None
 
 
 def extract(
@@ -84,9 +88,15 @@ def extract(
         n_states = machine.size
         status = "converged" if n_states <= hard_cap else "aborted"
     except Exception as e:  # noqa: BLE001 -- an aborted extraction is a data point, not a crash
+        # Bug fix, code audit 2026-09-06 (P2-3): the exception's type/message/
+        # traceback used to be discarded entirely -- an "error" result was
+        # indistinguishable from any other error, silently erasing the actual
+        # failure mode (which predicate subset OOMs vs. hits an AALpy bug vs.
+        # a real oracle fault all looked identical downstream).
         return ExtractionResult(status="error", machine=None, n_states=-1,
                                  n_queries=sul.num_queries, wall_time_s=time.time() - t0,
-                                 predicate_subset=predicate_subset)
+                                 predicate_subset=predicate_subset, error_type=type(e).__name__,
+                                 error_message=str(e), error_traceback=traceback.format_exc())
     return ExtractionResult(
         status=status, machine=machine, n_states=n_states,
         n_queries=sul.num_queries, wall_time_s=time.time() - t0,

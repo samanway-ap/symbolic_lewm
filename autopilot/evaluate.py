@@ -122,6 +122,21 @@ def evaluate_E_W(model, eval_slice: dict, pipeline, W_basis: np.ndarray, U8: np.
     return {"per_episode": per_episode, "tr_cov_w": tr_cov_w}
 
 
+def assert_slice_nonempty(eval_slice: dict, name: str, min_episodes: int = 1) -> None:
+    """Bug fix, code audit 2026-09-06 (P1-8): an empty or degenerate eval/
+    guard slice used to fail SILENTLY -- `evaluate_E_W` returns
+    `per_episode={}`, and every downstream mean-over-empty-dict collapses to
+    a default (0.0 or a `np.zeros(1)` placeholder) that then flows straight
+    into gates and gains as if it were a real, informative measurement.
+    Call this right after building a slice so a starved slice aborts the run
+    instead of silently producing a meaningless pass/fail."""
+    n = len(eval_slice.get("episode_ids", []))
+    if n < min_episodes:
+        raise RuntimeError(
+            f"IMPLEMENTATION_FAILURE: {name} has only {n} episode(s) (< min_episodes={min_episodes}) -- "
+            f"failing closed rather than silently evaluating on a degenerate slice")
+
+
 def paired_bootstrap_ci(vals_a: np.ndarray, vals_b: np.ndarray, seed: int, n_boot: int = 1000):
     rng = np.random.default_rng(seed)
     n = len(vals_a)

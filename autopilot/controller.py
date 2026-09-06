@@ -22,7 +22,7 @@ from autopilot.base_points import attach_full_geometry, select_base_points
 from autopilot.common import (
     AP_DIR, OUT_DIR, SEED, append_ledger, assert_disjoint_splits, build_splits,
     copy_to_downloads, load_frozen_directions, load_partial_model, now_iso, short_hash,
-    write_atomic,
+    stable_seed, write_atomic,
 )
 from autopilot.dataset import build_dataset_from_episodes, build_replay_dataset
 from autopilot.evaluate import build_eval_slice, evaluate_E_W, paired_bootstrap_ci, pool_W_basis
@@ -104,7 +104,7 @@ def probe_node(cand: dict, manifest: dict, model, pipeline, U8: np.ndarray, real
     suffix_len = cand.get("suffix", 1)
     route_val = manifest["episode_ids"]["route_val"]
     base_points = select_base_points(cand["base_policy"], route_val, pipeline, model, U_m,
-                                        real_latents_pool, seed=SEED + hash(cand["id"]) % 10000,
+                                        real_latents_pool, seed=stable_seed(SEED, cand["id"]),
                                         suffix_len=suffix_len)
     if not base_points:
         print(f"  [{cand['id']}] PROBE: no base points found -> STARVED", flush=True)
@@ -125,7 +125,7 @@ def get_or_build_curricula(cand: dict, probe: dict, manifest: dict, K: int, used
     action_floor = 0.05  # to avoid a second full-pool scan just to estimate percentiles per node
     curricula = {}
     for arm in ("orthogonal", "random_dir", "random_traj"):
-        seed = SEED + hash((cand["id"], arm)) % 100000
+        seed = stable_seed(SEED, cand["id"], arm)
         curricula[arm] = build_curriculum(arm, probe["base_points"], pool, K, seed, path_floor, action_floor,
                                               used_episodes)
         print(f"    [{cand['id']}] retrieval[{arm}]: {curricula[arm]['attrition']}", flush=True)
