@@ -1,0 +1,25 @@
+# Environments
+.venv/
+venv/
+env/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.hypothesis/
+
+# Generated research outputs / data caches / model checkpoints (large, not source)
+artifacts/
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local env/secrets, just in case
+.env
+.env.*
+*.pem
+*.key
