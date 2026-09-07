@@ -225,7 +225,7 @@ def compute_relevance_subspace(
           f"across {len(per_pair_contrib)} pairs", flush=True)
     if r / d > 0.9:
         print("  G.2 WARNING: r ~= d -- every direction matters, latent_subspace arm is vacuous "
-              "(plan §10 G.2's explicit caveat). Report this, do not silently run a no-op mask.", flush=True)
+              "(plan section 10 G.2's explicit caveat). Report this, do not silently run a no-op mask.", flush=True)
 
     return {
         "r": r, "d": d, "r_over_d": r / d,

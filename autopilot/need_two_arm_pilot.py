@@ -28,6 +28,20 @@ from pathlib import Path
 import numpy as np
 import torch
 
+# Hardening after the 2026-09-07 crash: a single non-ASCII character in one
+# print() call (the mathematical "cap"/intersection symbol) raised an
+# UnicodeEncodeError and killed an in-progress multi-hour unattended run,
+# because this Windows console's redirected stdout defaults to the cp1252
+# codepage, not UTF-8. Reconfiguring stdout/stderr to UTF-8 with
+# errors="replace" means any future stray non-ASCII character in a log line
+# degrades to a "?" instead of ever taking the whole run down again.
+# reconfigure() is only present on real TextIOWrapper streams (not always
+# true under some test/CI runners), so this is a no-op there rather than a
+# hard dependency.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 # Basic resource headroom (added after the 2026-09-05 crash: repeated
 # multiprocessing pool churn during retrieval exhausted OS resources and
 # froze the host). Capping BLAS/PyTorch CPU threads keeps this process from
@@ -652,7 +666,7 @@ def main() -> int:
           f"residual_basis_hash={fingerprint['residual_basis_hash'][:16]}... "
           f"code_commit={fingerprint['code_commit'][:12]}", flush=True)
 
-    print("=== building v2 region/candidate geometry (epoch-7 coordinates, corrected W=T∩V^perp, "
+    print("=== building v2 region/candidate geometry (epoch-7 coordinates, corrected W = T cap V^perp, "
           "no v1 cache) ===", flush=True)
     # Item 5: pass U4 explicitly -- build_regions_and_cells must never fall
     # through to its own load_frozen_directions() (epoch-20) in this path.
