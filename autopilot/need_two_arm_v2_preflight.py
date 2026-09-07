@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from autopilot.common import build_splits, load_partial_model, module_state_hash  # noqa: E402
 from autopilot.controller import fit_pipeline  # noqa: E402
 from autopilot.dataset import build_dataset_from_episodes  # noqa: E402
+from autopilot.evaluate import build_eval_slice, evaluate_E_W  # noqa: E402
 from autopilot.need_two_arm_pilot import run_checkpointed_training  # noqa: E402
 from oracle.droid_actions import load_actions_for_episodes  # noqa: E402
 from oracle.droid_streaming import stream_many_windows  # noqa: E402
@@ -141,8 +142,38 @@ def check2_coordinate_and_freeze(model, pipeline, manifest) -> bool:
     out_helper_after = encode_pixel_windows_batch(pix, model=model)
     targets_identical = torch.allclose(out_helper, out_helper_after, atol=1e-6)
 
+    # User-directed patch (item 7): "the fixed evaluation denominator is
+    # identical across arms." evaluate_E_W's tr_cov_w is computed FRESH each
+    # call from the eval_slice's OWN targets -- since encoder+projector are
+    # frozen (Change C), it must come out bit-identical regardless of which
+    # arm's checkpoint is loaded when evaluate_E_W is called. Verified here
+    # by training model.load_state_dict(theta0) back to two DIFFERENT
+    # 10-update checkpoints (arm-like) and comparing tr_cov_w on each,
+    # against the same eval_slice, against np.eye(D).
+    eval_ids = manifest["episode_ids"]["route_val"][:20]
+    eval_slice = build_eval_slice(eval_ids, n_per_episode=2, seed=5)
+    if len(eval_slice["samples"]) < 4:
+        print("  denominator check SKIPPED: could not build a usable eval_slice", flush=True)
+        denominator_identical = False
+    else:
+        from oracle.lewm_g import EMBED_DIM
+        D = EMBED_DIM
+        ds2 = build_dataset_from_episodes(manifest["episode_ids"]["replay_train"][20:40], pipeline,
+                                              max_windows_per_episode=4, seed=2)
+        model.load_state_dict(theta0)
+        denom_theta0 = evaluate_E_W(model, eval_slice, pipeline, np.eye(D), np.eye(D), np.zeros(D))["tr_cov_w"]
+        run_checkpointed_training(model, theta0, ds, seed=0, checkpoints=[10],
+                                      ckpt_dir=SCRATCH_CKPT_DIR / "check2_denom_arm1")
+        denom_arm1 = evaluate_E_W(model, eval_slice, pipeline, np.eye(D), np.eye(D), np.zeros(D))["tr_cov_w"]
+        run_checkpointed_training(model, theta0, ds2, seed=0, checkpoints=[10],
+                                      ckpt_dir=SCRATCH_CKPT_DIR / "check2_denom_arm2")
+        denom_arm2 = evaluate_E_W(model, eval_slice, pipeline, np.eye(D), np.eye(D), np.zeros(D))["tr_cov_w"]
+        denominator_identical = (abs(denom_theta0 - denom_arm1) < 1e-9 and abs(denom_theta0 - denom_arm2) < 1e-9)
+        print(f"  eval denominator (tr_cov_w): theta0={denom_theta0} arm1={denom_arm1} arm2={denom_arm2} "
+              f"identical_across_arms={denominator_identical}", flush=True)
+
     ok_all = (helper_matches_direct and differs_from_epoch20 and enc_before == enc_after
-                and proj_before == proj_after and targets_identical)
+                and proj_before == proj_after and targets_identical and denominator_identical)
     print(f"  helper==direct epoch-7 encoding: {helper_matches_direct}; differs from epoch-20: "
           f"{differs_from_epoch20}; encoder unchanged: {enc_before == enc_after}; projector unchanged: "
           f"{proj_before == proj_after}; targets pre==post training: {targets_identical}", flush=True)

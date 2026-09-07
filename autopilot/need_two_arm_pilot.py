@@ -38,15 +38,15 @@ torch.set_num_threads(4)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from autopilot.common import (  # noqa: E402
     OUT_DIR, SEED, assert_disjoint_splits, build_splits, checkpoint_file_sha256, copy_to_downloads,
-    git_commit_hash, load_frozen_directions, load_partial_model, module_state_hash, now_iso, short_hash,
-    stable_seed, write_atomic,
+    git_commit_hash, load_partial_model, module_state_hash, now_iso, short_hash, stable_seed, write_atomic,
 )
 from autopilot.controller import fit_pipeline  # noqa: E402
 from autopilot.dataset import ArmDataset, build_dataset_from_segments, build_replay_dataset  # noqa: E402
 from autopilot.evaluate import assert_slice_nonempty, build_eval_slice, evaluate_E_W, paired_bootstrap_ci  # noqa: E402
-from autopilot.need_common import AlphabetLookup, WallClockBudget, load_lever0_basis  # noqa: E402
+from autopilot.need_common import AlphabetLookup, WallClockBudget  # noqa: E402
 from autopilot.need_controller import build_regions_and_cells  # noqa: E402
 from autopilot.need_evaluate import build_cell_eval_slice, effective_rank, full_latent_predictions  # noqa: E402
+from autopilot.need_geometry import M_ACTION_DIRS  # noqa: E402
 from autopilot.need_targeted_retrieval import (  # noqa: E402
     K_FALLBACK, K_TARGET, MIN_COMMON_ELIGIBLE, N_OCCURRENCES_CAP, PER_EPISODE_CAP,
     resample_random_traj_curriculum, run_targeted_retrieval,
@@ -61,10 +61,17 @@ METRICS_PATH = OUT_DIR / "need_two_arm_v2_metrics.json"
 REPORT_PATH = OUT_DIR / "need_two_arm_v2_report.md"
 FROZEN_GEOMETRY_NPZ = OUT_DIR / "need_two_arm_v2_frozen_geometry.npz"
 FROZEN_GEOMETRY_FINGERPRINT_JSON = OUT_DIR / "need_two_arm_v2_frozen_geometry_fingerprint.json"
+LEVER0_V2_NPZ = OUT_DIR / "need_two_arm_v2_lever0_and_directions.npz"
 
 V1_METRICS_PATH = OUT_DIR / "need_two_arm_pilot_metrics.json"   # superseded, not deleted -- see mark_v1_invalidated
 
-GEOMETRY_SCHEMA_VERSION = 2
+# Bumped 2 -> 3 (user-directed minimal-changes patch before launch): U8/B8
+# and the Lever-0 residual basis are now recomputed in epoch-7 coordinates
+# (build_v2_lever0_and_directions) instead of reused from the six-arm tree's
+# own epoch-20-coordinate artifacts -- an explicit version bump FORCES any
+# existing v2 frozen-geometry cache to rebuild under the new fingerprint,
+# rather than relying only on the fingerprint dict happening to differ.
+GEOMETRY_SCHEMA_VERSION = 3
 
 MAX_WALL_HOURS = 5.0    # was 2.0 under v1's 2-arm x 2-seed design (4 training runs);
                           # v2's 2-arm x 5-pair design needs 10 -- scaled proportionally,
@@ -116,13 +123,22 @@ def mark_v1_invalidated() -> None:
           flush=True)
 
 
-def compute_fingerprint(model, pipeline, alphabet: AlphabetLookup, U8: np.ndarray, manifest: dict) -> dict:
+def compute_fingerprint(model, pipeline, alphabet: AlphabetLookup, U8: np.ndarray, residual_basis: np.ndarray,
+                            manifest: dict) -> dict:
     """Change A ("a runtime assertion recording the intended checkpoint hash
     with every latent cache") / Change D ("put this fingerprint in every new
     cache and manifest; refuse cache loading when any fingerprint field
     differs or is absent"). Every field here is either a content hash of
     something that, if it changed, would silently invalidate the geometry
-    this pilot depends on, or a declared selection constant."""
+    this pilot depends on, or a declared selection constant.
+
+    User-directed patch (item 6): added `u8_hash`/`residual_basis_hash` --
+    U8 and the Lever-0 residual_basis are now recomputed in epoch-7
+    coordinates (build_v2_lever0_and_directions), so their content must gate
+    cache reuse exactly like the checkpoint/encoder/projector hashes
+    already do. Combined with the GEOMETRY_SCHEMA_VERSION bump (2 -> 3),
+    this makes any existing v2 frozen-geometry cache built before this patch
+    fail the fingerprint match and rebuild."""
     return {
         "schema_version": GEOMETRY_SCHEMA_VERSION,
         "code_commit": git_commit_hash(),
@@ -138,7 +154,8 @@ def compute_fingerprint(model, pipeline, alphabet: AlphabetLookup, U8: np.ndarra
             "normalizer_std": pipeline.normalizer.std.round(6).tolist(),
         }),
         "alphabet_hash": alphabet.content_hash,
-        "u4_hash": short_hash(U8[:4].round(6).tolist()),
+        "u8_hash": short_hash(U8.round(6).tolist()),
+        "residual_basis_hash": short_hash(residual_basis.round(6).tolist()),
         "selection_constants": {
             "k_target_threshold": K_TARGET_THRESHOLD, "k_target": PILOT_K_TARGET,
             "k_fallback_threshold": K_FALLBACK_THRESHOLD, "k_fallback": PILOT_K_FALLBACK,
@@ -146,6 +163,53 @@ def compute_fingerprint(model, pipeline, alphabet: AlphabetLookup, U8: np.ndarra
             "n_occurrences_cap": N_OCCURRENCES_CAP, "per_episode_cap": PER_EPISODE_CAP,
         },
     }
+
+
+def build_v2_lever0_and_directions(model) -> dict:
+    """User-directed minimal-changes patch (before launch), items 2-4: U8/B8
+    (autopilot.common.load_frozen_directions -> tessellation_params_
+    residualized.npz) and the Lever-0 residual_basis (autopilot.need_common.
+    load_lever0_basis) were BOTH built from epoch-20-encoded latents
+    (encode_pixel_windows_batch's implicit default, inside both a0_label_
+    repair/residualized_tessellation.py's original construction and
+    corpus.latent_corpus.build_corpus) -- the same class of coordinate
+    mismatch Change A already fixed elsewhere on the v2 path, just not here.
+
+    Mechanically reproduces the ORIGINAL construction with NO tuning: same
+    fitting episodes (corpus.latent_corpus.train_ids()), same n_positions
+    (60), same ENERGY_TO_REMOVE (0.95), same M_MAX (8), same SEED (3072,
+    residualized_tessellation.py's own module constant) -- only the ONE
+    place latents get encoded now takes the explicit epoch-7 `model`
+    instead of falling through to encode_pixel_windows_batch's epoch-20
+    default. Cached under a need_two_arm_v2_* name; never overwrites the
+    six-arm tree's own lever0_residual_basis.npz / tessellation_params_
+    residualized.npz. `k_removed` is NOT compared against a0_residualized_
+    report.json's recorded value (unlike load_lever0_basis's own six-arm-
+    path check) -- that record was itself computed from epoch-20 latents,
+    so a different checkpoint legitimately producing a different k here is
+    expected, not an error."""
+    if LEVER0_V2_NPZ.exists():
+        d = np.load(LEVER0_V2_NPZ)
+        return {"residual_basis": d["residual_basis"], "k_removed": int(d["k_removed"]),
+                  "energy_removed": float(d["energy_removed"]), "U8": d["U8"], "B8": d["B8"]}
+
+    from a0_label_repair.episode_variance import scatter_decomposition
+    from a0_label_repair.residualized_tessellation import (
+        ENERGY_TO_REMOVE, M_MAX, SEED as LEVER0_SEED, build_residual_basis, draw_directions_in_complement,
+        fit_offsets,
+    )
+    from corpus.latent_corpus import build_corpus, train_ids
+
+    train = build_corpus(train_ids(), 60, "need_two_arm_v2_train", model=model, force=True)
+    sd = scatter_decomposition(train)
+    residual_basis, k_removed = build_residual_basis(sd["Sigma_between"], ENERGY_TO_REMOVE)
+    U8 = draw_directions_in_complement(residual_basis, M_MAX, LEVER0_SEED)
+    B8 = fit_offsets(U8, train.flat_latents())
+
+    np.savez(LEVER0_V2_NPZ, residual_basis=residual_basis, k_removed=k_removed, energy_removed=ENERGY_TO_REMOVE,
+                U8=U8, B8=B8, seed=LEVER0_SEED)
+    return {"residual_basis": residual_basis, "k_removed": k_removed, "energy_removed": ENERGY_TO_REMOVE,
+              "U8": U8, "B8": B8}
 
 
 def save_v2_frozen_geometry(anchors: np.ndarray, candidates: list[dict], fingerprint: dict) -> None:
@@ -188,7 +252,7 @@ def load_v2_frozen_geometry() -> dict | None:
 
 
 def get_or_build_v2_candidates(manifest: dict, lever0_basis: dict, model, pipeline, alphabet: AlphabetLookup,
-                                  wall: WallClockBudget, fingerprint: dict) -> dict:
+                                  wall: WallClockBudget, fingerprint: dict, U4: np.ndarray) -> dict:
     """Change D: NEVER loads v1's frozen geometry/retrieval caches (built
     under a different checkpoint mixture, a different W=T-cap-V^perp
     computation, and a different action-timing convention). Rebuilds
@@ -200,7 +264,11 @@ def get_or_build_v2_candidates(manifest: dict, lever0_basis: dict, model, pipeli
     deterministic order; do not force the old N00 identity to survive the
     correction" (Change D) -- `build_regions_and_cells` without
     `target_cells` already does exactly this: fresh eta_c-ranked candidates
-    N00/N01/N02, no comparison against any prior attempt's recorded values."""
+    N00/N01/N02, no comparison against any prior attempt's recorded values.
+
+    `U4` (item 5) is passed straight through to `build_regions_and_cells`,
+    which must never fall back to its own `load_frozen_directions()` (epoch-
+    20 coordinates) on this path."""
     cached = load_v2_frozen_geometry()
     if cached is not None and cached["fingerprint"] == fingerprint:
         print("  reusing persisted v2 frozen geometry (fingerprint match)", flush=True)
@@ -210,7 +278,7 @@ def get_or_build_v2_candidates(manifest: dict, lever0_basis: dict, model, pipeli
               flush=True)
     print("  building regions/candidates fresh under the corrected geometry (no v1 cache, no ATTEMPT1 "
           "reference verification) ...", flush=True)
-    result = build_regions_and_cells(manifest, lever0_basis, model, pipeline, alphabet, wall)
+    result = build_regions_and_cells(manifest, lever0_basis, model, pipeline, alphabet, wall, U4=U4)
     if result["status"] != "OK":
         return result
     save_v2_frozen_geometry(result["anchors"], result["candidates"], fingerprint)
@@ -275,18 +343,40 @@ def build_exact_k_replay_dataset(replay_train_ids: list[int], k_use: int, pipeli
     return out
 
 
-def assert_segments_survive(dataset: ArmDataset, frozen_segment_ids: set[tuple[int, int]], n_curriculum: int) -> None:
+def assert_segments_survive(dataset: ArmDataset, frozen_segments: list[dict], n_curriculum: int) -> None:
     """Required invariant (TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md section
-    3, Check 3 / preflight): every curriculum sample's (episode, position)
-    must be exactly one of the frozen selected segments -- 100%, not merely
-    high. Checks only the first `n_curriculum` samples (the curriculum
-    portion; replay samples are drawn from `replay_train` and are never
-    expected to be in `frozen_segment_ids`)."""
-    hits = sum(1 for s in dataset.samples[:n_curriculum] if (s["episode"], s["pos"]) in frozen_segment_ids)
+    3, Check 3 / preflight): every curriculum sample must be exactly one of
+    the frozen selected segments -- 100%, not merely high. Checks only the
+    first `n_curriculum` samples (the curriculum portion; replay samples are
+    drawn from `replay_train` and are never expected to match a frozen
+    segment).
+
+    User-directed patch (item 7): checks CONTENT (the pixels/raw_action
+    bytes, via each segment's own `content_hash`), not merely (episode_id,
+    t) -- an (eid, t) match alone would not catch a wiring bug that
+    substituted a different decode of the same nominal position (e.g. a
+    stale cache, a different camera, a re-decode under different frame
+    alignment)."""
+    frozen_by_key = {(int(s["eid"]), int(s["t"])): s["content_hash"] for s in frozen_segments}
+    if len(frozen_by_key) != len(frozen_segments):
+        raise RuntimeError("IMPLEMENTATION_FAILURE: duplicate (episode_id, t) among frozen segments")
+    hits = 0
+    for s in dataset.samples[:n_curriculum]:
+        key = (s["episode"], s["pos"])
+        expected_hash = frozen_by_key.get(key)
+        if expected_hash is None:
+            continue   # not even an (episode_id, t) match
+        if s.get("content_hash") is None:
+            raise RuntimeError(
+                f"IMPLEMENTATION_FAILURE: dataset sample for {key} carries no content_hash -- "
+                f"build_dataset_from_segments did not thread it through")
+        if s["content_hash"] == expected_hash:
+            hits += 1
     if hits != n_curriculum:
         raise RuntimeError(
             f"IMPLEMENTATION_FAILURE: segment-retention invariant violated -- {hits}/{n_curriculum} "
-            f"curriculum samples matched a frozen selected (episode_id, t); expected 100%")
+            f"curriculum samples matched a frozen selected segment's (episode_id, t) AND content_hash; "
+            f"expected 100%")
 
 
 def paired_eid_arrays(per_episode_a: dict, per_episode_b: dict) -> tuple:
@@ -465,24 +555,45 @@ def main() -> int:
     print(f"=== need_two_arm_pilot v2 INIT ({now_iso()}) ===", flush=True)
     manifest = build_splits()
     assert_disjoint_splits(manifest)
-    lever0_basis = load_lever0_basis()
-    alphabet = AlphabetLookup()
+
+    # User-directed patch (minimal changes before launch), item 1: load epoch
+    # 7 FIRST -- every downstream geometry step (Lever-0 basis, U8/B8, region
+    # anchors, retrieval, evaluation) now depends on this exact model object.
     model = load_partial_model()   # epoch 7 -- see checkpoints.PARTIAL_EPOCH
     theta0_state = copy.deepcopy(model.state_dict())
+    alphabet = AlphabetLookup()
     # Fit on replay_train only (Change P0-6, carried forward): route_val backs
     # eval_slice, so fitting on it too would leak eval-set action statistics
     # into the (frozen, reused-everywhere) pipeline before evaluation begins.
     pipeline = fit_pipeline(manifest["episode_ids"]["replay_train"])
 
-    U8, B8 = load_frozen_directions()
-    fingerprint = compute_fingerprint(model, pipeline, alphabet, U8, manifest)
+    # Items 2-4: re-encode the ORIGINAL fixed Lever-0 fitting episodes with
+    # the explicit epoch-7 model and mechanically recompute residual_basis/
+    # U8/B8 using the original parameters and seeds (no tuning); item 5:
+    # save under need_two_arm_v2_* names, never touching the six-arm tree's
+    # own lever0_residual_basis.npz / tessellation_params_residualized.npz.
+    print("=== recomputing Lever-0 residual basis + U8/B8 in epoch-7 coordinates (v2) ===", flush=True)
+    v2_lever0 = build_v2_lever0_and_directions(model)
+    lever0_basis = {"residual_basis": v2_lever0["residual_basis"], "k_removed": v2_lever0["k_removed"],
+                       "energy_removed": v2_lever0["energy_removed"]}
+    U8, B8 = v2_lever0["U8"], v2_lever0["B8"]
+    U4 = U8[:M_ACTION_DIRS]
+    print(f"  v2 Lever-0: k_removed={v2_lever0['k_removed']} (epoch-7 coordinates; NOT compared against the "
+          f"epoch-20 a0_residualized_report.json record -- a different checkpoint's latents legitimately give "
+          f"a different k)", flush=True)
+
+    fingerprint = compute_fingerprint(model, pipeline, alphabet, U8, v2_lever0["residual_basis"], manifest)
     print(f"  fingerprint: checkpoint_sha256={fingerprint['checkpoint_sha256'][:16]}... "
-          f"encoder_hash={fingerprint['encoder_hash'][:16]}... code_commit={fingerprint['code_commit'][:12]}",
-          flush=True)
+          f"encoder_hash={fingerprint['encoder_hash'][:16]}... u8_hash={fingerprint['u8_hash'][:16]}... "
+          f"residual_basis_hash={fingerprint['residual_basis_hash'][:16]}... "
+          f"code_commit={fingerprint['code_commit'][:12]}", flush=True)
 
     print("=== building v2 region/candidate geometry (epoch-7 coordinates, corrected W=T∩V^perp, "
           "no v1 cache) ===", flush=True)
-    build_result = get_or_build_v2_candidates(manifest, lever0_basis, model, pipeline, alphabet, wall, fingerprint)
+    # Item 5: pass U4 explicitly -- build_regions_and_cells must never fall
+    # through to its own load_frozen_directions() (epoch-20) in this path.
+    build_result = get_or_build_v2_candidates(manifest, lever0_basis, model, pipeline, alphabet, wall, fingerprint,
+                                                   U4=U4)
     if build_result["status"] != "OK":
         write_pilot_report("RETRIEVAL_INFEASIBLE", {"reason": f"E0 build failed: {build_result['status']}"}, wall)
         return 1
@@ -526,9 +637,6 @@ def main() -> int:
     print(f"  chosen: {chosen['id']} (region={chosen['region']}, action={chosen['action']}); K={k_use}; "
           f"need_curriculum={need_curric['attrition']}; random_traj eligible pool={len(traj_pool)}", flush=True)
 
-    need_segment_ids = {(int(s["eid"]), int(s["t"])) for s in need_segments}
-    need_episode_ids = sorted({eid for eid, _ in need_segment_ids})
-
     write_atomic(MANIFEST_PATH, {
         "timestamp": now_iso(), "fingerprint": fingerprint,
         "chosen_candidate": chosen["id"], "region": chosen["region"], "action": chosen["action"],
@@ -565,7 +673,7 @@ def main() -> int:
     replay_ds = build_exact_k_replay_dataset(manifest["episode_ids"]["replay_train"], k_use, pipeline,
                                                  seed=replay_seed)
     need_ds = build_arm_dataset(need_segments, replay_ds, pipeline)
-    assert_segments_survive(need_ds, need_segment_ids, len(need_segments))
+    assert_segments_survive(need_ds, need_segments, len(need_segments))
     print(f"  need_curriculum dataset: {len(need_ds.samples)} samples "
           f"({len(need_segments)} curriculum + {len(replay_ds.samples)} shared replay, fixed across all "
           f"{N_PAIRS} pairs)", flush=True)
@@ -590,8 +698,7 @@ def main() -> int:
                                                                per_episode_cap=PER_EPISODE_CAP)
         random_curricula_by_pair[pair_idx] = random_curric_j
         random_ds_j = build_arm_dataset(random_curric_j["segments"], replay_ds, pipeline)
-        random_segment_ids_j = {(int(s["eid"]), int(s["t"])) for s in random_curric_j["segments"]}
-        assert_segments_survive(random_ds_j, random_segment_ids_j, k_use)
+        assert_segments_survive(random_ds_j, random_curric_j["segments"], k_use)
 
         for arm_name, ds in (("need_curriculum", need_ds), ("matched_random", random_ds_j)):
             print(f"  pair={pair_idx} training arm={arm_name} seed={PAIR_SEEDS[pair_idx]} "

@@ -74,8 +74,14 @@ def build_dataset_from_segments(segments: list[dict], pipeline: "ActionPipeline"
     scored (no second decode, and structurally unable to substitute a
     different position) -- one training sample per segment, not up to eight
     random ones per episode."""
+    # content_hash/region/letter carried through when the segment has them
+    # (need_targeted_retrieval.py's `_segments()` always sets these) so
+    # downstream invariant checks (need_two_arm_pilot.assert_segments_survive)
+    # can verify actual pixel/action CONTENT, not just (episode_id, t).
     samples = [{"pixels": np.asarray(seg["pixels"]), "raw_action": np.asarray(seg["raw_action"]),
-                "episode": int(seg["eid"]), "pos": int(seg["t"])} for seg in segments]
+                "episode": int(seg["eid"]), "pos": int(seg["t"]),
+                "content_hash": seg.get("content_hash"), "region": seg.get("region"), "letter": seg.get("letter")}
+                 for seg in segments]
     episode_ids = sorted(set(s["episode"] for s in samples))
     return ArmDataset(samples=samples, pipeline=pipeline, episode_ids=episode_ids)
 

@@ -104,7 +104,8 @@ def _mark_confirm_consumed(state: dict, name: str) -> None:
 
 
 def build_regions_and_cells(manifest: dict, lever0_basis: dict, model, pipeline, alphabet: AlphabetLookup,
-                               wall: WallClockBudget, target_cells: list[tuple] | None = None) -> dict:
+                               wall: WallClockBudget, target_cells: list[tuple] | None = None,
+                               U4: np.ndarray | None = None) -> dict:
     """`target_cells`, if given, is a list of (region, action) pairs to
     build geometry for DIRECTLY, in the given order, bypassing the
     residual-energy pre-screen/eta_c ranking entirely. Needed because that
@@ -117,7 +118,19 @@ def build_regions_and_cells(manifest: dict, lever0_basis: dict, model, pipeline,
     for specific cells sidesteps the ranking comparison altogether: we
     already know which (region, action) pairs we want, so we only need them
     to still be SUPPORTED and to produce valid geometry, not to out-rank
-    nearby competitors under noisy measurements."""
+    nearby competitors under noisy measurements.
+
+    `U4`, if given, is used DIRECTLY instead of the module-level
+    `load_frozen_directions()[0][:M_ACTION_DIRS]` fallback (user-directed
+    minimal-changes patch before the two-arm v2 launch: U8/B8 in
+    tessellation_params_residualized.npz were themselves built from
+    epoch-20-encoded latents -- the same class of coordinate mismatch
+    Change A already fixed elsewhere. The v2 pilot recomputes U8 in epoch-7
+    coordinates (need_two_arm_pilot.build_v2_lever0_and_directions) and
+    passes U4=U8[:M_ACTION_DIRS] here explicitly; it must never fall through
+    to this function's own `load_frozen_directions()` call. The six-arm
+    tree's own call site passes nothing, keeping its existing epoch-20
+    behavior unchanged."""
     replay_ids = manifest["episode_ids"]["replay_train"]
     route_ids = manifest["episode_ids"]["route_val"]
 
@@ -173,7 +186,9 @@ def build_regions_and_cells(manifest: dict, lever0_basis: dict, model, pipeline,
     all_znext = np.stack([r["z_next"] for (r_, a) in supported for r in by_cell[(r_, a)]])
     tr_cov_global = float(np.trace(np.cov(all_znext.T))) if all_znext.shape[0] > 1 else 1.0
 
-    U4 = load_frozen_directions()[0][:M_ACTION_DIRS]
+    # User-directed patch: never call load_frozen_directions() (epoch-20
+    # coordinates) when a caller supplies its own U4 explicitly.
+    U4 = U4 if U4 is not None else load_frozen_directions()[0][:M_ACTION_DIRS]
 
     if target_cells is not None:
         missing = [cell for cell in target_cells if cell not in supported]

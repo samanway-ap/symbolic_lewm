@@ -62,8 +62,14 @@ class Corpus:
 def build_corpus(
     episode_ids: list[int], n_positions: int, cache_name: str,
     chunk: int = 16, max_workers: int = 16, encode_bs: int = 4,
-    keep_raw_actions: bool = False, force: bool = False,
+    keep_raw_actions: bool = False, force: bool = False, model=None,
 ) -> Corpus:
+    """`model` defaults to None (encode_pixel_windows_batch's own epoch-20
+    fallback), matching every existing caller's historical behavior. Add
+    this explicitly (and pass a distinct `cache_name` + `force=True`) to
+    build a corpus in a DIFFERENT checkpoint's coordinates -- e.g. the
+    two-arm v2 pilot's epoch-7 Lever-0 recomputation
+    (need_two_arm_pilot.build_v2_lever0_and_directions)."""
     cache = OUT_DIR / f"corpus_{cache_name}.npz"
     if cache.exists() and not force:
         blob = np.load(cache, allow_pickle=False)
@@ -97,7 +103,7 @@ def build_corpus(
             print(f"  chunk {i // chunk}: 0/{len(batch)} usable, skipping", flush=True)
             continue
         px = np.stack([windows[e] for e in ok])
-        emb = encode_pixel_windows_batch(px, batch_size=encode_bs).numpy().astype(np.float32)
+        emb = encode_pixel_windows_batch(px, batch_size=encode_bs, model=model).numpy().astype(np.float32)
         for j, e in enumerate(ok):
             conv = pipeline.to_convention(actions_all[e][:n_raw].astype(np.float64))
             s = quantize_to_symbols(conv, K_STAR, feats, names)  # length n_positions
