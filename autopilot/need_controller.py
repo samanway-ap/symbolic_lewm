@@ -105,7 +105,7 @@ def _mark_confirm_consumed(state: dict, name: str) -> None:
 
 def build_regions_and_cells(manifest: dict, lever0_basis: dict, model, pipeline, alphabet: AlphabetLookup,
                                wall: WallClockBudget, target_cells: list[tuple] | None = None,
-                               U4: np.ndarray | None = None) -> dict:
+                               U4: np.ndarray | None = None, w_mode: str = "exact") -> dict:
     """`target_cells`, if given, is a list of (region, action) pairs to
     build geometry for DIRECTLY, in the given order, bypassing the
     residual-energy pre-screen/eta_c ranking entirely. Needed because that
@@ -130,7 +130,12 @@ def build_regions_and_cells(manifest: dict, lever0_basis: dict, model, pipeline,
     passes U4=U8[:M_ACTION_DIRS] here explicitly; it must never fall through
     to this function's own `load_frozen_directions()` call. The six-arm
     tree's own call site passes nothing, keeping its existing epoch-20
-    behavior unchanged."""
+    behavior unchanged.
+
+    `w_mode` ("exact" default, or "soft") is passed straight through to
+    every `build_cell_geometry` call below -- see that function's docstring.
+    Only the two-arm v3 experiment revision passes "soft"; every other
+    caller keeps the unchanged exact-intersection default."""
     replay_ids = manifest["episode_ids"]["replay_train"]
     route_ids = manifest["episode_ids"]["route_val"]
 
@@ -199,7 +204,7 @@ def build_regions_and_cells(manifest: dict, lever0_basis: dict, model, pipeline,
         frozen = []
         for r, a in target_cells:
             geom = build_cell_geometry(by_cell[(r, a)], anchors[r], real_latents_by_region[r],
-                                          model, pipeline, U4, seed=stable_seed(SEED, r, a))
+                                          model, pipeline, U4, seed=stable_seed(SEED, r, a), w_mode=w_mode)
             if geom is None:
                 raise RuntimeError(f"FATAL_SPEC_AMBIGUITY: target cell (r={r}, a={a}) produced invalid "
                                       f"geometry on reconstruction")
@@ -230,7 +235,7 @@ def build_regions_and_cells(manifest: dict, lever0_basis: dict, model, pipeline,
         valid_cells = []
         for r, a, energy in prescreened:
             geom = build_cell_geometry(by_cell[(r, a)], anchors[r], real_latents_by_region[r],
-                                          model, pipeline, U4, seed=stable_seed(SEED, r, a))
+                                          model, pipeline, U4, seed=stable_seed(SEED, r, a), w_mode=w_mode)
             if geom is None:
                 print(f"    cell (r={r}, a={a}): INVALID, discarded", flush=True)
                 continue

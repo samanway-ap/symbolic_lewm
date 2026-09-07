@@ -1,19 +1,33 @@
-"""Two-arm feasibility pilot, v2: does the frozen action-conditioned need
-curriculum (`need_curriculum`) beat matched-random sampling
+"""Two-arm feasibility pilot, v3 (W_soft): does the frozen action-conditioned
+need curriculum (`need_curriculum`) beat matched-random sampling
 (`matched_random`) at short-horizon, frozen-encoder(+projector) prediction,
 in the node's own predeclared need subspace N(r,a,1)?
 
-v2 (TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md, reviewed revision db57a54):
-implements Changes A-F required before this experiment is interpretable.
-The v1 result (`need_two_arm_pilot_metrics.json`, TWO_ARM_NEGATIVE) is
-superseded, not deleted -- see `mark_v1_invalidated`. This script writes
-ONLY under the `need_two_arm_v2_*` namespace, never loads v1's frozen
-geometry/retrieval caches (Change D: different checkpoint coordinates,
-different need-space math, different action-timing convention -- those
-caches are invalid under this code), and never assigns/opens a
-confirm_A/B/C shard (this is a feasibility signal, not a confirmatory test
--- see the DECISION RULE in `main` for exactly what a positive result does
-and does not license).
+v2 (TWO_ARM_EXPERIMENT_REQUIRED_CHANGES.md, reviewed revision db57a54)
+implemented Changes A-F required before this experiment was interpretable,
+and ran to completion: EVERY pre-screened (region, action) cell's exact
+W = T \\cap V^perp intersection came out empty (dim_V, 20-45, far exceeded
+dim_T, 4-10, in all 11 cells -- a generic, expected consequence of the
+corrected intersection math, not a bug), so v2 recorded a legitimate
+RETRIEVAL_INFEASIBLE (`need_two_arm_v2_metrics.json`) -- preserved verbatim,
+never overwritten or deleted; see `note_v2_result`.
+
+v3 (user-directed, 2026-09-07) is a SEPARATE, ADDITIONAL experiment
+revision exploring a deliberately looser W construction, W_soft (see
+`autopilot.geometry.soft_tangent_min_alignment`): the bottom min(4, dim_T)
+right-singular directions of `V_basis @ T_basis.T` -- the directions in T
+LEAST aligned with V, rather than EXACTLY orthogonal to it. Everything else
+(GRADIENT_ENERGY, M_ACTION_DIRS, the residual-energy pre-screen, candidate
+count, retrieval rules/constants, two arms, five pairs, training schedule,
+evaluation, guards) is UNCHANGED from v2. Reuses the fingerprinted epoch-7
+Lever-0 corpus verbatim (`build_v2_lever0_and_directions`, still v2-named
+since it is not itself changing); candidate geometry is invalidated and
+rebuilt (GEOMETRY_SCHEMA_VERSION bump + a new fingerprint field) since the
+W-computation itself changed. Writes ONLY under the `need_two_arm_v3_*`
+namespace (retrieval/geometry caches, manifest, metrics, report, progress,
+wall-clock state) and never assigns/opens a confirm_A/B/C shard (this is a
+feasibility signal, not a confirmatory test -- see the DECISION RULE in
+`main` for exactly what a positive result does and does not license).
 """
 from __future__ import annotations
 
@@ -70,26 +84,41 @@ from checkpoints import PARTIAL_EPOCH  # noqa: E402
 from oracle.lewm_g import DEVICE, HISTORY_SIZE  # noqa: E402
 from training.finetune import _collate  # noqa: E402
 
-PILOT_DIR = OUT_DIR / "need_two_arm_v2_nodes"
-MANIFEST_PATH = OUT_DIR / "need_two_arm_v2_manifest.json"
-METRICS_PATH = OUT_DIR / "need_two_arm_v2_metrics.json"
-REPORT_PATH = OUT_DIR / "need_two_arm_v2_report.md"
-FROZEN_GEOMETRY_NPZ = OUT_DIR / "need_two_arm_v2_frozen_geometry.npz"
-FROZEN_GEOMETRY_FINGERPRINT_JSON = OUT_DIR / "need_two_arm_v2_frozen_geometry_fingerprint.json"
+PILOT_DIR = OUT_DIR / "need_two_arm_v3_nodes"
+MANIFEST_PATH = OUT_DIR / "need_two_arm_v3_manifest.json"
+METRICS_PATH = OUT_DIR / "need_two_arm_v3_metrics.json"
+REPORT_PATH = OUT_DIR / "need_two_arm_v3_report.md"
+FROZEN_GEOMETRY_NPZ = OUT_DIR / "need_two_arm_v3_frozen_geometry.npz"
+FROZEN_GEOMETRY_FINGERPRINT_JSON = OUT_DIR / "need_two_arm_v3_frozen_geometry_fingerprint.json"
+# Reused verbatim from v2 -- the Lever-0/U8/B8 construction itself is NOT
+# changing in this revision (only the candidate-geometry W-computation is),
+# so this stays v2-named and is neither renamed nor rebuilt.
 LEVER0_V2_NPZ = OUT_DIR / "need_two_arm_v2_lever0_and_directions.npz"
-RETRIEVAL_CACHE_PKL = OUT_DIR / "need_two_arm_v2_retrieval_cache.pkl"
-PROGRESS_PATH = OUT_DIR / "need_two_arm_v2_progress.json"
-WALL_CLOCK_STATE_PATH = OUT_DIR / "need_two_arm_v2_wall_clock_state.json"
+RETRIEVAL_CACHE_PKL = OUT_DIR / "need_two_arm_v3_retrieval_cache.pkl"
+PROGRESS_PATH = OUT_DIR / "need_two_arm_v3_progress.json"
+WALL_CLOCK_STATE_PATH = OUT_DIR / "need_two_arm_v3_wall_clock_state.json"
 
 V1_METRICS_PATH = OUT_DIR / "need_two_arm_pilot_metrics.json"   # superseded, not deleted -- see mark_v1_invalidated
+# v2's completed, VALID (not invalidated) RETRIEVAL_INFEASIBLE result --
+# read-only reference, never written/overwritten by this (v3) script. See
+# `note_v2_result`.
+V2_METRICS_PATH = OUT_DIR / "need_two_arm_v2_metrics.json"
 
-# Bumped 2 -> 3 (user-directed minimal-changes patch before launch): U8/B8
-# and the Lever-0 residual basis are now recomputed in epoch-7 coordinates
-# (build_v2_lever0_and_directions) instead of reused from the six-arm tree's
-# own epoch-20-coordinate artifacts -- an explicit version bump FORCES any
-# existing v2 frozen-geometry cache to rebuild under the new fingerprint,
-# rather than relying only on the fingerprint dict happening to differ.
-GEOMETRY_SCHEMA_VERSION = 3
+# W construction for candidate geometry: "exact" (T \\cap V^perp, v2's
+# choice) or "soft" (autopilot.geometry.soft_tangent_min_alignment, v3's
+# choice -- see module docstring). This is the ONLY scientific-method
+# change between v2 and v3; every other predeclared constant below is
+# unchanged from v2.
+W_MODE = "soft"
+W_SOFT_M_MAX = 4
+
+# Bumped 3 -> 4 (v3, W_soft revision): candidate geometry now uses a
+# genuinely different W-construction, so the geometry cache must be
+# invalidated and rebuilt -- an explicit version bump FORCES this rather
+# than relying only on the fingerprint dict happening to differ (it also
+# lives under a brand new v3-named cache file, so there is no risk of
+# colliding with v2's own exact-intersection cache either way).
+GEOMETRY_SCHEMA_VERSION = 4
 
 MAX_WALL_HOURS = 5.0    # was 2.0 under v1's 2-arm x 2-seed design (4 training runs);
                           # v2's 2-arm x 5-pair design needs 10 -- scaled proportionally,
@@ -135,10 +164,24 @@ def mark_v1_invalidated() -> None:
         "the corrections in Changes D-F. Not deleted or numerically rewritten -- see need_two_arm_v2_metrics.json "
         "for the corrected implementation's result."
     )
-    payload["invalidated_by"] = str(METRICS_PATH.name)
+    payload["invalidated_by"] = str(V2_METRICS_PATH.name)   # v2 is what actually superseded v1, not this (v3) run
     write_atomic(V1_METRICS_PATH, payload)
     print(f"  marked {V1_METRICS_PATH.name} INVALIDATED_IMPLEMENTATION (numerical contents preserved verbatim)",
           flush=True)
+
+
+def note_v2_result() -> None:
+    """v2's completed RETRIEVAL_INFEASIBLE result is a LEGITIMATE outcome
+    under correct code (every pre-screened cell's exact T \\cap V^perp
+    intersection came out empty), not a bug -- so unlike v1, it is NOT
+    invalidated. This just reads it (read-only, never writes) so the log of
+    a v3 run states plainly, at a glance, what v2 already established."""
+    if not V2_METRICS_PATH.exists():
+        print("  (no v2 result found on disk to reference)", flush=True)
+        return
+    v2 = json.loads(V2_METRICS_PATH.read_text())
+    print(f"  v2 (exact intersection) result on record: status={v2.get('status')} "
+          f"reason={v2.get('reason', '(none)')} -- preserved untouched, not overwritten by this v3 run", flush=True)
 
 
 def compute_fingerprint(model, pipeline, alphabet: AlphabetLookup, U8: np.ndarray, residual_basis: np.ndarray,
@@ -154,11 +197,12 @@ def compute_fingerprint(model, pipeline, alphabet: AlphabetLookup, U8: np.ndarra
     U8 and the Lever-0 residual_basis are now recomputed in epoch-7
     coordinates (build_v2_lever0_and_directions), so their content must gate
     cache reuse exactly like the checkpoint/encoder/projector hashes
-    already do. Combined with the GEOMETRY_SCHEMA_VERSION bump (2 -> 3),
-    this makes any existing v2 frozen-geometry cache built before this patch
-    fail the fingerprint match and rebuild."""
+    already do. Also carries `w_mode`/`w_soft_m_max` (v3): a geometry cache
+    built under one W-construction must never be silently reused under a
+    different one, even if every other input happens to match."""
     return {
         "schema_version": GEOMETRY_SCHEMA_VERSION,
+        "w_mode": W_MODE, "w_soft_m_max": W_SOFT_M_MAX if W_MODE == "soft" else None,
         "code_commit": git_commit_hash(),
         "checkpoint_epoch": PARTIAL_EPOCH,
         "checkpoint_sha256": checkpoint_file_sha256(PARTIAL_EPOCH),
@@ -230,13 +274,18 @@ def build_v2_lever0_and_directions(model) -> dict:
               "U8": U8, "B8": B8}
 
 
-def save_v2_frozen_geometry(anchors: np.ndarray, candidates: list[dict], fingerprint: dict) -> None:
+def save_v3_frozen_geometry(anchors: np.ndarray, candidates: list[dict], fingerprint: dict) -> None:
     payload = {"anchors": anchors}
     for c in candidates:
         g = c["geometry"]
         for key in ("T_basis", "V_basis", "W_basis", "B_N"):
             payload[f"{c['id']}__{key}"] = g[key]
         payload[f"{c['id']}__meta"] = np.array([c["region"], c["action"], g["q"], g["eta_c"]], dtype=object)
+        # W_soft diagnostics (user-directed): ALL singular values, recorded
+        # for inspection only -- never consumed by load_v3_frozen_geometry
+        # to gate anything.
+        if "w_soft_singular_values" in g:
+            payload[f"{c['id']}__w_soft_singular_values"] = g["w_soft_singular_values"]
         gg = c.get("global_geometry") or {}
         if not gg.get("empty", True):
             payload[f"{c['id']}__W_all_basis"] = gg["W_all_basis"]
@@ -245,7 +294,7 @@ def save_v2_frozen_geometry(anchors: np.ndarray, candidates: list[dict], fingerp
     FROZEN_GEOMETRY_FINGERPRINT_JSON.write_text(json.dumps({"fingerprint": fingerprint}, indent=2, default=str))
 
 
-def load_v2_frozen_geometry() -> dict | None:
+def load_v3_frozen_geometry() -> dict | None:
     if not (FROZEN_GEOMETRY_NPZ.exists() and FROZEN_GEOMETRY_FINGERPRINT_JSON.exists()):
         return None
     d = np.load(FROZEN_GEOMETRY_NPZ, allow_pickle=True)
@@ -259,6 +308,8 @@ def load_v2_frozen_geometry() -> dict | None:
                     "dim_T": int(d[f"{cid}__T_basis"].shape[0]), "dim_V": int(d[f"{cid}__V_basis"].shape[0]),
                     "dim_W": int(d[f"{cid}__W_basis"].shape[0]), "dim_N": int(d[f"{cid}__B_N"].shape[0]),
                     "q": int(meta[2]), "eta_c": float(meta[3])}
+        if f"{cid}__w_soft_singular_values" in d.files:
+            geometry["w_soft_singular_values"] = d[f"{cid}__w_soft_singular_values"]
         global_geometry = {"empty": True}
         if f"{cid}__W_all_basis" in d.files:
             global_geometry = {"empty": False, "W_all_basis": d[f"{cid}__W_all_basis"],
@@ -269,7 +320,7 @@ def load_v2_frozen_geometry() -> dict | None:
     return {"anchors": anchors, "candidates": candidates, "fingerprint": fingerprint}
 
 
-def save_v2_retrieval_cache(fingerprint: dict, chosen_id: str, chosen_region: int, chosen_action: str,
+def save_v3_retrieval_cache(fingerprint: dict, chosen_id: str, chosen_region: int, chosen_action: str,
                                 curricula: dict, retrieval_stats: dict) -> None:
     """Resumability: Stage 1/2 retrieval (a full retrieval_pool scan plus
     decoding up to N_OCCURRENCES_CAP occurrences) is the single most
@@ -286,7 +337,7 @@ def save_v2_retrieval_cache(fingerprint: dict, chosen_id: str, chosen_region: in
                         "chosen_action": chosen_action, "curricula": curricula, "retrieval_stats": retrieval_stats}, f)
 
 
-def load_v2_retrieval_cache(fingerprint: dict) -> dict | None:
+def load_v3_retrieval_cache(fingerprint: dict) -> dict | None:
     if not RETRIEVAL_CACHE_PKL.exists():
         return None
     with open(RETRIEVAL_CACHE_PKL, "rb") as f:
@@ -324,13 +375,13 @@ def load_cumulative_wall_hours() -> float:
     return 0.0
 
 
-def get_or_build_v2_candidates(manifest: dict, lever0_basis: dict, model, pipeline, alphabet: AlphabetLookup,
+def get_or_build_v3_candidates(manifest: dict, lever0_basis: dict, model, pipeline, alphabet: AlphabetLookup,
                                   wall: WallClockBudget, fingerprint: dict, U4: np.ndarray) -> dict:
-    """Change D: NEVER loads v1's frozen geometry/retrieval caches (built
-    under a different checkpoint mixture, a different W=T-cap-V^perp
-    computation, and a different action-timing convention). Rebuilds
-    regions and candidates fresh under the corrected geometry every time
-    the fingerprint changes; a matching-fingerprint v2 cache IS reused
+    """Change D (carried forward from v2, applied again for v3's own cache):
+    NEVER loads v1's or v2's frozen geometry/retrieval caches (each built
+    under a different W-construction / checkpoint mixture / action-timing
+    convention). Rebuilds regions and candidates fresh under W_MODE every
+    time the fingerprint changes; a matching-fingerprint v3 cache IS reused
     (this is expensive to rebuild -- a full replay_train/route_val scan --
     and the fingerprint already proves nothing scientifically relevant
     changed). "Select the first supported candidate in a frozen
@@ -339,22 +390,23 @@ def get_or_build_v2_candidates(manifest: dict, lever0_basis: dict, model, pipeli
     `target_cells` already does exactly this: fresh eta_c-ranked candidates
     N00/N01/N02, no comparison against any prior attempt's recorded values.
 
-    `U4` (item 5) is passed straight through to `build_regions_and_cells`,
-    which must never fall back to its own `load_frozen_directions()` (epoch-
-    20 coordinates) on this path."""
-    cached = load_v2_frozen_geometry()
+    `U4` is passed straight through to `build_regions_and_cells`, which must
+    never fall back to its own `load_frozen_directions()` (epoch-20
+    coordinates) on this path; `W_MODE`/`W_SOFT_M_MAX` (module-level) select
+    the soft W-construction for this revision."""
+    cached = load_v3_frozen_geometry()
     if cached is not None and cached["fingerprint"] == fingerprint:
-        print("  reusing persisted v2 frozen geometry (fingerprint match)", flush=True)
+        print("  reusing persisted v3 frozen geometry (fingerprint match)", flush=True)
         return {"status": "OK", "candidates": cached["candidates"], "anchors": cached["anchors"]}
     if cached is not None:
-        print("  v2 frozen-geometry cache fingerprint MISMATCH -- discarding stale cache, rebuilding from scratch",
+        print("  v3 frozen-geometry cache fingerprint MISMATCH -- discarding stale cache, rebuilding from scratch",
               flush=True)
-    print("  building regions/candidates fresh under the corrected geometry (no v1 cache, no ATTEMPT1 "
-          "reference verification) ...", flush=True)
-    result = build_regions_and_cells(manifest, lever0_basis, model, pipeline, alphabet, wall, U4=U4)
+    print(f"  building regions/candidates fresh under W_MODE={W_MODE!r} (no v1/v2 cache, no ATTEMPT1 "
+          f"reference verification) ...", flush=True)
+    result = build_regions_and_cells(manifest, lever0_basis, model, pipeline, alphabet, wall, U4=U4, w_mode=W_MODE)
     if result["status"] != "OK":
         return result
-    save_v2_frozen_geometry(result["anchors"], result["candidates"], fingerprint)
+    save_v3_frozen_geometry(result["anchors"], result["candidates"], fingerprint)
     return {"status": "OK", "candidates": result["candidates"], "anchors": result["anchors"]}
 
 
@@ -613,20 +665,21 @@ def write_pilot_report(status: str, extra: dict, wall: WallClockBudget) -> None:
     payload = {"status": status, "timestamp": now_iso(), "wall_hours_used": wall.elapsed_hours(),
                  "wall_hours_budget": MAX_WALL_HOURS, **extra}
     write_atomic(METRICS_PATH, payload)
-    md = [f"# Two-arm feasibility pilot (v2)", "", f"**Status:** {status}", "",
+    md = [f"# Two-arm feasibility pilot (v3, W_soft)", "", f"**Status:** {status}", "",
            f"Wall-clock used: {payload['wall_hours_used']:.2f}h / {MAX_WALL_HOURS}h", ""]
     if "reason" in extra:
         md += [f"Reason: {extra['reason']}", ""]
     REPORT_PATH.write_text("\n".join(md))
     copy_to_downloads(METRICS_PATH, REPORT_PATH, MANIFEST_PATH)
-    print(f"\n=== PILOT v2 FINAL: {status} ({wall.elapsed_hours():.2f}h) ===", flush=True)
+    print(f"\n=== PILOT v3 FINAL: {status} ({wall.elapsed_hours():.2f}h) ===", flush=True)
 
 
 def main() -> int:
     mark_v1_invalidated()
+    note_v2_result()
     initial_elapsed = load_cumulative_wall_hours()
     wall = WallClockBudget(MAX_WALL_HOURS, initial_elapsed_hours=initial_elapsed)
-    print(f"=== need_two_arm_pilot v2 INIT ({now_iso()}) ===", flush=True)
+    print(f"=== need_two_arm_pilot v3 (W_soft) INIT ({now_iso()}) ===", flush=True)
     if initial_elapsed > 0:
         print(f"  resuming: {initial_elapsed:.2f}h already charged against the {MAX_WALL_HOURS}h budget from a "
               f"prior (interrupted) attempt", flush=True)
@@ -666,11 +719,11 @@ def main() -> int:
           f"residual_basis_hash={fingerprint['residual_basis_hash'][:16]}... "
           f"code_commit={fingerprint['code_commit'][:12]}", flush=True)
 
-    print("=== building v2 region/candidate geometry (epoch-7 coordinates, corrected W = T cap V^perp, "
-          "no v1 cache) ===", flush=True)
-    # Item 5: pass U4 explicitly -- build_regions_and_cells must never fall
+    print(f"=== building v3 region/candidate geometry (epoch-7 coordinates, W_MODE={W_MODE!r}, "
+          f"no v1/v2 cache) ===", flush=True)
+    # U4 passed explicitly -- build_regions_and_cells must never fall
     # through to its own load_frozen_directions() (epoch-20) in this path.
-    build_result = get_or_build_v2_candidates(manifest, lever0_basis, model, pipeline, alphabet, wall, fingerprint,
+    build_result = get_or_build_v3_candidates(manifest, lever0_basis, model, pipeline, alphabet, wall, fingerprint,
                                                    U4=U4)
     if build_result["status"] != "OK":
         write_pilot_report("RETRIEVAL_INFEASIBLE", {"reason": f"E0 build failed: {build_result['status']}"}, wall)
@@ -684,9 +737,9 @@ def main() -> int:
     # Resumability: the retrieval cache is gated by the SAME fingerprint as
     # the frozen-geometry cache -- a hit skips the (expensive) Stage 1/2
     # scan entirely and goes straight to the already-chosen cell's curricula.
-    cached_retrieval = load_v2_retrieval_cache(fingerprint)
+    cached_retrieval = load_v3_retrieval_cache(fingerprint)
     if cached_retrieval is not None:
-        print(f"  reusing persisted v2 retrieval cache (fingerprint match): chosen={cached_retrieval['chosen_id']}",
+        print(f"  reusing persisted v3 retrieval cache (fingerprint match): chosen={cached_retrieval['chosen_id']}",
               flush=True)
         chosen = next(c for c in candidates if c["id"] == cached_retrieval["chosen_id"])
         curricula = cached_retrieval["curricula"]
@@ -713,7 +766,7 @@ def main() -> int:
                                     "retrieval_stats": retrieval_stats}, wall)
             return 1
         curricula = curricula_by_cell[(chosen["region"], chosen["action"])]
-        save_v2_retrieval_cache(fingerprint, chosen["id"], chosen["region"], chosen["action"], curricula,
+        save_v3_retrieval_cache(fingerprint, chosen["id"], chosen["region"], chosen["action"], curricula,
                                     retrieval_stats)
 
     need_curric, random_curric = curricula["conditional_need"], curricula["random_traj"]
@@ -727,13 +780,29 @@ def main() -> int:
     assert len(random_curric["segments"]) == k_use, (
         "IMPLEMENTATION_FAILURE: require_exact_k=True did not produce matched arm cardinality")
     traj_pool = random_curric["_pool_for_resampling"]
+    chosen_geom = chosen["geometry"]
     print(f"  chosen: {chosen['id']} (region={chosen['region']}, action={chosen['action']}); K={k_use}; "
           f"need_curriculum={need_curric['attrition']}; random_traj eligible pool={len(traj_pool)}", flush=True)
+    print(f"  chosen geometry: w_mode={chosen_geom.get('w_mode')} dim_T={chosen_geom['dim_T']} "
+          f"dim_V={chosen_geom['dim_V']} dim_W={chosen_geom['dim_W']} q={chosen_geom['q']} "
+          f"eta_c={chosen_geom['eta_c']:.4f}"
+          + (f" w_soft_singular_values={np.round(chosen_geom['w_soft_singular_values'], 4).tolist()}"
+               if "w_soft_singular_values" in chosen_geom else ""), flush=True)
 
     write_atomic(MANIFEST_PATH, {
         "timestamp": now_iso(), "fingerprint": fingerprint,
         "chosen_candidate": chosen["id"], "region": chosen["region"], "action": chosen["action"],
         "candidates_considered_order": [c["id"] for c in candidates],
+        # User-directed: geometry diagnostics for the chosen candidate --
+        # dim_T/dim_V/dim_W plus, in soft mode, EVERY singular value of
+        # C = V_basis @ T_basis.T (never used to gate feasibility, recorded
+        # for inspection only).
+        "chosen_geometry_diagnostics": {
+            "w_mode": chosen_geom.get("w_mode"), "dim_T": chosen_geom["dim_T"], "dim_V": chosen_geom["dim_V"],
+            "dim_W": chosen_geom["dim_W"], "q": chosen_geom["q"], "eta_c": chosen_geom["eta_c"],
+            "w_soft_singular_values": (chosen_geom["w_soft_singular_values"].tolist()
+                                          if "w_soft_singular_values" in chosen_geom else None),
+        },
         "k_cascade": {"k_target_threshold": K_TARGET_THRESHOLD, "k_target": PILOT_K_TARGET,
                         "k_fallback_threshold": K_FALLBACK_THRESHOLD, "k_fallback": PILOT_K_FALLBACK,
                         "min_common_eligible": PILOT_MIN_COMMON_ELIGIBLE, "per_episode_cap": PER_EPISODE_CAP,
@@ -928,7 +997,7 @@ def main() -> int:
     }
     write_atomic(METRICS_PATH, metrics)
 
-    md = [f"# Two-arm feasibility pilot (v2)", "", f"**Result: {label}**", "",
+    md = [f"# Two-arm feasibility pilot (v3, W_soft)", "", f"**Result: {label}**", "",
            f"Candidate: {chosen['id']} (region={chosen['region']}, action={chosen['action']}), K={k_use}, "
            f"N_PAIRS={N_PAIRS}", "",
            f"Per-pair Delta_j (need gain - random gain): {deltas}", "",
@@ -942,7 +1011,7 @@ def main() -> int:
            "## Not claimed", ""] + [f"- {x}" for x in metrics["not_claimed"]]
     REPORT_PATH.write_text("\n".join(md))
     copy_to_downloads(METRICS_PATH, REPORT_PATH, MANIFEST_PATH)
-    print(f"\n=== PILOT v2 FINAL: {label} ({wall.elapsed_hours():.2f}h) ===", flush=True)
+    print(f"\n=== PILOT v3 FINAL: {label} ({wall.elapsed_hours():.2f}h) ===", flush=True)
     return 0
 
 

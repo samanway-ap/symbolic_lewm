@@ -25,7 +25,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from autopilot.common import stable_seed  # noqa: E402
-from autopilot.geometry import intersect_tangent_with_Vperp, local_tangent, score_grad_bank_aligned  # noqa: E402
+from autopilot.geometry import (  # noqa: E402
+    intersect_tangent_with_Vperp, local_tangent, score_grad_bank_aligned, soft_tangent_min_alignment,
+)
 from autopilot.need_common import AlphabetLookup, project_residualized  # noqa: E402
 from oracle.droid_actions import load_actions_for_episodes  # noqa: E402
 from oracle.droid_streaming import stream_many_windows  # noqa: E402
@@ -285,21 +287,42 @@ def random_subspace_inside(container_basis: np.ndarray, dim: int, seed: int) -> 
 
 def build_cell_geometry(records_for_cell: list[dict], anchor_z: np.ndarray,
                            real_latents_pool: np.ndarray, model, pipeline, U_m: np.ndarray, seed: int,
-                           k_local: int = 256) -> dict | None:
-    """Full T/V/W/N for one (region, action) cell."""
+                           k_local: int = 256, w_mode: str = "exact", w_soft_m_max: int = 4) -> dict | None:
+    """Full T/V/W/N for one (region, action) cell.
+
+    `w_mode` (user-directed follow-up, 2026-09-07): "exact" (default,
+    UNCHANGED behavior -- `project_T_into_Vperp`, the true T \\cap V^perp
+    intersection) is what every existing caller (the six-arm v6/v7 trees,
+    and the completed two-arm v2 exact-intersection attempt, preserved as
+    RETRIEVAL_INFEASIBLE in need_two_arm_v2_metrics.json) still gets by
+    default. "soft" uses `soft_tangent_min_alignment` instead -- the two-arm
+    v3 experiment revision's own explicit choice, passed down from
+    `need_two_arm_pilot.py` via `build_regions_and_cells`."""
     T_basis, neigh, neigh_idx = local_tangent(anchor_z, real_latents_pool, k_local, TANGENT_ENERGY)
     grad = build_cell_gradient_basis(records_for_cell, model, pipeline, U_m, seed)
-    W_basis = project_T_into_Vperp(T_basis, grad["V_basis"])
+    singular_values = None
+    if w_mode == "exact":
+        W_basis = project_T_into_Vperp(T_basis, grad["V_basis"])
+    elif w_mode == "soft":
+        soft = soft_tangent_min_alignment(T_basis, grad["V_basis"], m_max=w_soft_m_max)
+        W_basis, singular_values = soft["W_soft_basis"], soft["singular_values"]
+    else:
+        raise ValueError(f"unknown w_mode {w_mode!r}")
     if W_basis.shape[0] == 0:
         return None
     need = build_need_basis(records_for_cell, W_basis)
     if need["energy_zero"] or need["B_N"].shape[0] == 0:
         return None
-    return {"T_basis": T_basis, "V_basis": grad["V_basis"], "W_basis": W_basis, "B_N": need["B_N"],
-            "dim_T": int(T_basis.shape[0]), "dim_V": int(grad["V_basis"].shape[0]),
-            "dim_W": int(W_basis.shape[0]), "dim_N": int(need["B_N"].shape[0]),
-            "q": need["q"], "eta_c": need["eta_c"],
-            "gradient_starts": grad["n_starts"], "gradient_episodes": grad["n_episodes"]}
+    result = {"T_basis": T_basis, "V_basis": grad["V_basis"], "W_basis": W_basis, "B_N": need["B_N"],
+                "dim_T": int(T_basis.shape[0]), "dim_V": int(grad["V_basis"].shape[0]),
+                "dim_W": int(W_basis.shape[0]), "dim_N": int(need["B_N"].shape[0]),
+                "q": need["q"], "eta_c": need["eta_c"], "w_mode": w_mode,
+                "gradient_starts": grad["n_starts"], "gradient_episodes": grad["n_episodes"]}
+    if singular_values is not None:
+        # Diagnostic ONLY (user-directed): recorded for inspection, never
+        # used anywhere to gate cell feasibility.
+        result["w_soft_singular_values"] = singular_values
+    return result
 
 
 def build_global_W_control(region_id: int, sibling_action_records: dict[str, list[dict]], anchor_z: np.ndarray,

@@ -114,6 +114,68 @@ def intersect_tangent_with_Vperp(T_basis: np.ndarray, V_basis: np.ndarray, rtol:
     return W_basis
 
 
+def soft_tangent_min_alignment(T_basis: np.ndarray, V_basis: np.ndarray, m_max: int = 4) -> dict:
+    """W_soft: user-directed follow-up (2026-09-07) to the exact intersection
+    above. Running the corrected `intersect_tangent_with_Vperp` for real,
+    under epoch-7 coordinates, gave dim_W = 0 for every one of 11
+    pre-screened (region, action) candidate cells (recorded RETRIEVAL_
+    INFEASIBLE in need_two_arm_v2_metrics.json) -- NOT because of a bug, but
+    because in every cell dim_V (20-45) was far larger than dim_T (4-10), so
+    a GENERIC exact intersection is expected to collapse to {0} (the
+    "excess" dimension of V has nowhere else to come from). This is exactly
+    what `intersect_tangent_with_Vperp`'s own docstring warns the OLD buggy
+    projection method was papering over -- so it is not itself suspicious.
+
+    `intersect_tangent_with_Vperp` is left completely unchanged above (the
+    exact-intersection result stays reproducible/re-runnable); this is a
+    SEPARATE, deliberately looser construction used by a NEW experiment
+    revision: instead of requiring EXACT orthogonality to every direction in
+    V (singular value == 0), take the `min(m_max, dim_T)` directions in T
+    that V "sees" least -- the bottom `m_max` right-singular vectors of
+    C = V_basis @ T_basis.T, i.e. the directions w in T's own coordinate
+    space with the SMALLEST |C @ w| (closest to orthogonal to V, without
+    requiring exact orthogonality) -- mapped back into the ambient space via
+    T_basis, which (T_basis having orthonormal rows) preserves orthonormality
+    exactly, same as the exact-intersection construction.
+
+    Returns {"W_soft_basis": (m, D), "singular_values": (t,) -- ALL of C's
+    singular values, largest-to-smallest, recorded as a diagnostic and never
+    used to gate feasibility -- callers must not filter/reject cells based
+    on this array}. Every algebraic invariant the construction is SUPPOSED
+    to satisfy is asserted here at runtime (not just documented), since this
+    is a new, not-yet-battle-tested construction:
+      1. W_soft_basis has orthonormal rows.
+      2. every row of W_soft_basis lies inside T (is unchanged by projecting
+         onto T's own row space).
+      3. the selected singular values really are the smallest ones (C's full
+         singular value array, as returned by SVD, is non-increasing)."""
+    d = T_basis.shape[1]
+    if V_basis.shape[0] == 0 or T_basis.shape[0] == 0:
+        return {"W_soft_basis": T_basis, "singular_values": np.zeros(0)}
+    C = V_basis @ T_basis.T                                     # (v, t)
+    _, s, Vh = np.linalg.svd(C, full_matrices=True)             # Vh: (t, t), s descending
+    m = min(m_max, T_basis.shape[0])
+    bottom = Vh[-m:]                                             # (m, t) -- smallest-|C w| directions
+    W_soft_basis = bottom @ T_basis                              # (m, D) -- mapped back to ambient space
+
+    if m > 0:
+        gram = W_soft_basis @ W_soft_basis.T
+        max_dev = float(np.abs(gram - np.eye(m)).max())
+        if max_dev > 1e-5:
+            raise RuntimeError(f"IMPLEMENTATION_FAILURE: W_soft rows are not orthonormal "
+                                 f"(max Gram-vs-identity deviation {max_dev:.2e})")
+        reprojected = W_soft_basis @ T_basis.T @ T_basis
+        max_dev = float(np.abs(W_soft_basis - reprojected).max())
+        if max_dev > 1e-5:
+            raise RuntimeError(f"IMPLEMENTATION_FAILURE: W_soft rows do not lie inside T "
+                                 f"(max deviation under re-projection onto T {max_dev:.2e})")
+    if s.size > 1 and np.any(np.diff(s) > 1e-9):
+        raise RuntimeError("IMPLEMENTATION_FAILURE: SVD singular values are not non-increasing -- "
+                             "the bottom-m slice would not be the smallest m values")
+
+    return {"W_soft_basis": W_soft_basis, "singular_values": s}
+
+
 def local_tangent(base_z: np.ndarray, real_latents: np.ndarray, k: int = 256, energy: float = PCA_ENERGY):
     d2 = ((real_latents - base_z[None, :]) ** 2).sum(axis=1)
     idx = np.argpartition(d2, min(k, len(d2) - 1))[:k]
