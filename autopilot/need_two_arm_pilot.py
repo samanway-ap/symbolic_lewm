@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import json
+import pickle
 import random
 import sys
 from collections import Counter
@@ -62,6 +63,9 @@ REPORT_PATH = OUT_DIR / "need_two_arm_v2_report.md"
 FROZEN_GEOMETRY_NPZ = OUT_DIR / "need_two_arm_v2_frozen_geometry.npz"
 FROZEN_GEOMETRY_FINGERPRINT_JSON = OUT_DIR / "need_two_arm_v2_frozen_geometry_fingerprint.json"
 LEVER0_V2_NPZ = OUT_DIR / "need_two_arm_v2_lever0_and_directions.npz"
+RETRIEVAL_CACHE_PKL = OUT_DIR / "need_two_arm_v2_retrieval_cache.pkl"
+PROGRESS_PATH = OUT_DIR / "need_two_arm_v2_progress.json"
+WALL_CLOCK_STATE_PATH = OUT_DIR / "need_two_arm_v2_wall_clock_state.json"
 
 V1_METRICS_PATH = OUT_DIR / "need_two_arm_pilot_metrics.json"   # superseded, not deleted -- see mark_v1_invalidated
 
@@ -249,6 +253,61 @@ def load_v2_frozen_geometry() -> dict | None:
                               "geometry": geometry, "global_geometry": global_geometry})
     fingerprint = json.loads(FROZEN_GEOMETRY_FINGERPRINT_JSON.read_text())["fingerprint"]
     return {"anchors": anchors, "candidates": candidates, "fingerprint": fingerprint}
+
+
+def save_v2_retrieval_cache(fingerprint: dict, chosen_id: str, chosen_region: int, chosen_action: str,
+                                curricula: dict, retrieval_stats: dict) -> None:
+    """Resumability: Stage 1/2 retrieval (a full retrieval_pool scan plus
+    decoding up to N_OCCURRENCES_CAP occurrences) is the single most
+    expensive step after the one-time Lever-0/geometry builds -- if the
+    process is interrupted partway through training and restarted, this
+    lets it skip straight back to training instead of re-scanning the pool.
+    Only the CHOSEN cell's curricula are persisted (not every candidate
+    cell's, which would also include large per-candidate eligible-segment
+    pools for cells that were never used) -- gated by the SAME `fingerprint`
+    already used for the frozen-geometry cache, so it is invalidated exactly
+    when the geometry/checkpoint/pipeline it depends on would be."""
+    with open(RETRIEVAL_CACHE_PKL, "wb") as f:
+        pickle.dump({"fingerprint": fingerprint, "chosen_id": chosen_id, "chosen_region": chosen_region,
+                        "chosen_action": chosen_action, "curricula": curricula, "retrieval_stats": retrieval_stats}, f)
+
+
+def load_v2_retrieval_cache(fingerprint: dict) -> dict | None:
+    if not RETRIEVAL_CACHE_PKL.exists():
+        return None
+    with open(RETRIEVAL_CACHE_PKL, "rb") as f:
+        cached = pickle.load(f)
+    if cached.get("fingerprint") != fingerprint:
+        return None
+    return cached
+
+
+def write_progress(stage: str, wall: WallClockBudget, extra: dict | None = None) -> None:
+    """Resumability / "keep me posted while traveling": a small, cheap,
+    always-current snapshot of which stage the run has reached, written
+    after every major milestone (Lever-0 done, geometry done, retrieval
+    done + chosen candidate, and after EVERY pair's training+eval
+    completes with cumulative per-pair deltas so far) -- readable at any
+    time without needing the process to still be alive, and copied to
+    Downloads exactly like the final report already is."""
+    payload = {"stage": stage, "timestamp": now_iso(), "wall_hours_used": wall.elapsed_hours(),
+                 "wall_hours_budget": MAX_WALL_HOURS, **(extra or {})}
+    write_atomic(PROGRESS_PATH, payload)
+    write_atomic(WALL_CLOCK_STATE_PATH, {"cumulative_hours_used": wall.elapsed_hours()})
+    copy_to_downloads(PROGRESS_PATH)
+    print(f"  [progress] stage={stage} wall={wall.elapsed_hours():.2f}h", flush=True)
+
+
+def load_cumulative_wall_hours() -> float:
+    """Resumability: the wall-clock budget must persist ACROSS restarts, not
+    reset to 0 every time the process relaunches -- matching this codebase's
+    existing convention (autopilot.need_common.WallClockBudget's own
+    docstring: "lets a relaunch... count a prior attempt's spent time
+    against the SAME cumulative budget... backdates the clock rather than
+    tracking two separate budgets")."""
+    if WALL_CLOCK_STATE_PATH.exists():
+        return float(json.loads(WALL_CLOCK_STATE_PATH.read_text()).get("cumulative_hours_used", 0.0))
+    return 0.0
 
 
 def get_or_build_v2_candidates(manifest: dict, lever0_basis: dict, model, pipeline, alphabet: AlphabetLookup,
@@ -551,8 +610,12 @@ def write_pilot_report(status: str, extra: dict, wall: WallClockBudget) -> None:
 
 def main() -> int:
     mark_v1_invalidated()
-    wall = WallClockBudget(MAX_WALL_HOURS)
+    initial_elapsed = load_cumulative_wall_hours()
+    wall = WallClockBudget(MAX_WALL_HOURS, initial_elapsed_hours=initial_elapsed)
     print(f"=== need_two_arm_pilot v2 INIT ({now_iso()}) ===", flush=True)
+    if initial_elapsed > 0:
+        print(f"  resuming: {initial_elapsed:.2f}h already charged against the {MAX_WALL_HOURS}h budget from a "
+              f"prior (interrupted) attempt", flush=True)
     manifest = build_splits()
     assert_disjoint_splits(manifest)
 
@@ -581,6 +644,7 @@ def main() -> int:
     print(f"  v2 Lever-0: k_removed={v2_lever0['k_removed']} (epoch-7 coordinates; NOT compared against the "
           f"epoch-20 a0_residualized_report.json record -- a different checkpoint's latents legitimately give "
           f"a different k)", flush=True)
+    write_progress("lever0_done", wall, {"k_removed": v2_lever0["k_removed"]})
 
     fingerprint = compute_fingerprint(model, pipeline, alphabet, U8, v2_lever0["residual_basis"], manifest)
     print(f"  fingerprint: checkpoint_sha256={fingerprint['checkpoint_sha256'][:16]}... "
@@ -601,31 +665,46 @@ def main() -> int:
     anchors = build_result["anchors"]
     print(f"  candidates (frozen deterministic order, by eta_c descending -- NOT forced to match any prior "
           f"attempt's N00 identity): {[(c['id'], c['region'], c['action']) for c in candidates]}", flush=True)
+    write_progress("geometry_done", wall, {"candidates": [c["id"] for c in candidates]})
 
-    print(f"=== targeted retrieval (pilot cascade: >={K_TARGET_THRESHOLD}->K={PILOT_K_TARGET}, "
-          f">={K_FALLBACK_THRESHOLD}->K={PILOT_K_FALLBACK}), fixed {N_OCCURRENCES_CAP}-occurrence SHA-ordered "
-          f"prefix, {RETRIEVAL_MAX_MINUTES:.0f}-min SAFETY ABORT, per-episode cap={PER_EPISODE_CAP} ===",
-          flush=True)
-    curricula_by_cell, retrieval_stats = run_targeted_retrieval(
-        candidates, manifest["episode_ids"]["retrieval_pool"], anchors, lever0_basis, pipeline, model, alphabet,
-        seed=SEED, max_minutes=RETRIEVAL_MAX_MINUTES, min_common_eligible=PILOT_MIN_COMMON_ELIGIBLE,
-        k_target_threshold=K_TARGET_THRESHOLD, k_target=PILOT_K_TARGET, k_fallback=PILOT_K_FALLBACK,
-        n_occurrences_cap=N_OCCURRENCES_CAP, per_episode_cap=PER_EPISODE_CAP, require_exact_k=True)
+    # Resumability: the retrieval cache is gated by the SAME fingerprint as
+    # the frozen-geometry cache -- a hit skips the (expensive) Stage 1/2
+    # scan entirely and goes straight to the already-chosen cell's curricula.
+    cached_retrieval = load_v2_retrieval_cache(fingerprint)
+    if cached_retrieval is not None:
+        print(f"  reusing persisted v2 retrieval cache (fingerprint match): chosen={cached_retrieval['chosen_id']}",
+              flush=True)
+        chosen = next(c for c in candidates if c["id"] == cached_retrieval["chosen_id"])
+        curricula = cached_retrieval["curricula"]
+        retrieval_stats = cached_retrieval["retrieval_stats"]
+    else:
+        print(f"=== targeted retrieval (pilot cascade: >={K_TARGET_THRESHOLD}->K={PILOT_K_TARGET}, "
+              f">={K_FALLBACK_THRESHOLD}->K={PILOT_K_FALLBACK}), fixed {N_OCCURRENCES_CAP}-occurrence "
+              f"SHA-ordered prefix, {RETRIEVAL_MAX_MINUTES:.0f}-min SAFETY ABORT, per-episode "
+              f"cap={PER_EPISODE_CAP} ===", flush=True)
+        curricula_by_cell, retrieval_stats = run_targeted_retrieval(
+            candidates, manifest["episode_ids"]["retrieval_pool"], anchors, lever0_basis, pipeline, model, alphabet,
+            seed=SEED, max_minutes=RETRIEVAL_MAX_MINUTES, min_common_eligible=PILOT_MIN_COMMON_ELIGIBLE,
+            k_target_threshold=K_TARGET_THRESHOLD, k_target=PILOT_K_TARGET, k_fallback=PILOT_K_FALLBACK,
+            n_occurrences_cap=N_OCCURRENCES_CAP, per_episode_cap=PER_EPISODE_CAP, require_exact_k=True)
 
-    chosen = None
-    for cand in candidates:   # frozen order: first retrieval-feasible cell wins, not best-scoring
-        if curricula_by_cell.get((cand["region"], cand["action"])) is not None:
-            chosen = cand
-            break
-    if chosen is None:
-        write_pilot_report("RETRIEVAL_INFEASIBLE",
-                              {"candidates_tried": [c["id"] for c in candidates], "retrieval_stats": retrieval_stats},
-                              wall)
-        return 1
+        chosen = None
+        for cand in candidates:   # frozen order: first retrieval-feasible cell wins, not best-scoring
+            if curricula_by_cell.get((cand["region"], cand["action"])) is not None:
+                chosen = cand
+                break
+        if chosen is None:
+            write_pilot_report("RETRIEVAL_INFEASIBLE",
+                                  {"candidates_tried": [c["id"] for c in candidates],
+                                    "retrieval_stats": retrieval_stats}, wall)
+            return 1
+        curricula = curricula_by_cell[(chosen["region"], chosen["action"])]
+        save_v2_retrieval_cache(fingerprint, chosen["id"], chosen["region"], chosen["action"], curricula,
+                                    retrieval_stats)
 
-    cell = (chosen["region"], chosen["action"])
-    curricula = curricula_by_cell[cell]
     need_curric, random_curric = curricula["conditional_need"], curricula["random_traj"]
+    write_progress("retrieval_done", wall, {"chosen_candidate": chosen["id"], "region": chosen["region"],
+                                                "action": chosen["action"]})
     # run_targeted_retrieval(require_exact_k=True) already guarantees every
     # arm has EXACTLY k_use segments (Change F items 2-4) -- no post-hoc
     # min()-truncation ("MIN_COMMON_K") needed or permitted here anymore.
@@ -701,11 +780,27 @@ def main() -> int:
         assert_segments_survive(random_ds_j, random_curric_j["segments"], k_use)
 
         for arm_name, ds in (("need_curriculum", need_ds), ("matched_random", random_ds_j)):
-            print(f"  pair={pair_idx} training arm={arm_name} seed={PAIR_SEEDS[pair_idx]} "
-                  f"({N_UPDATES_PRIMARY} updates, diagnostic at {N_UPDATES_DIAGNOSTIC})...", flush=True)
             ckpt_dir = node_dir / arm_name / f"pair{pair_idx}"
-            cps = run_checkpointed_training(model, theta0_state, ds, PAIR_SEEDS[pair_idx],
-                                                [N_UPDATES_DIAGNOSTIC, N_UPDATES_PRIMARY], ckpt_dir)
+            primary_ckpt = ckpt_dir / f"seed{PAIR_SEEDS[pair_idx]}_step{N_UPDATES_PRIMARY}.pt"
+            diag_ckpt = ckpt_dir / f"seed{PAIR_SEEDS[pair_idx]}_step{N_UPDATES_DIAGNOSTIC}.pt"
+            # Resumability: if a prior (interrupted) run already produced
+            # BOTH checkpoints for this exact (pair, arm), reuse them instead
+            # of retraining -- the curriculum/replay/seed/RNG-reset are all
+            # fully deterministic (Check 4), so a retrained run would give an
+            # identical result anyway; this only saves the wasted recompute.
+            # A run that died BEFORE reaching the 200-update diagnostic
+            # checkpoint leaves neither file, so at most 200 updates of work
+            # are ever lost to an interruption.
+            if primary_ckpt.exists() and diag_ckpt.exists():
+                print(f"  pair={pair_idx} arm={arm_name}: RESUMING -- both checkpoints already exist, "
+                      f"skipping training", flush=True)
+                cps = {N_UPDATES_DIAGNOSTIC: {"checkpoint": str(diag_ckpt), "loss": None},
+                         N_UPDATES_PRIMARY: {"checkpoint": str(primary_ckpt), "loss": None}}
+            else:
+                print(f"  pair={pair_idx} training arm={arm_name} seed={PAIR_SEEDS[pair_idx]} "
+                      f"({N_UPDATES_PRIMARY} updates, diagnostic at {N_UPDATES_DIAGNOSTIC})...", flush=True)
+                cps = run_checkpointed_training(model, theta0_state, ds, PAIR_SEEDS[pair_idx],
+                                                    [N_UPDATES_DIAGNOSTIC, N_UPDATES_PRIMARY], ckpt_dir)
 
             model.load_state_dict(torch.load(cps[N_UPDATES_PRIMARY]["checkpoint"], map_location=DEVICE))
             post = _eval_all(model, eval_slice, guard_slice, pipeline, B_N, W_basis, V_basis, U8, B8)
@@ -725,6 +820,19 @@ def main() -> int:
                                       {"reason": f"wall-clock exhausted mid-training at pair={pair_idx} "
                                                    f"arm={arm_name}"}, wall)
                 return 1
+
+        # Resumability / "keep me posted": a running tally after every pair,
+        # readable even if the process is later interrupted or the machine
+        # is unreachable -- includes the per-pair-so-far E_N means and the
+        # running gain delta for every COMPLETED pair.
+        pairs_done_so_far = [p for p in PAIR_SEEDS if p in per_pair["need_curriculum"] and p in per_pair["matched_random"]]
+        write_progress("pair_completed", wall, {
+            "pair_just_completed": pair_idx, "pairs_done": pairs_done_so_far, "n_pairs_total": N_PAIRS,
+            "pre_E_N": pre_E_N,
+            "per_pair_E_N_mean_so_far": {
+                arm: {str(p): float(np.mean(per_pair[arm][p]["E_N"])) for p in pairs_done_so_far}
+                for arm in ("need_curriculum", "matched_random")},
+        })
 
     print("=== computing metrics ===", flush=True)
     gains, per_pair_E_N_mean = {}, {"need_curriculum": {}, "matched_random": {}}
